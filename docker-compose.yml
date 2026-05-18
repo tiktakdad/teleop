@@ -1,0 +1,169 @@
+###############################################################################
+# Isaac Teleop 통합 Docker Compose
+#
+# 서비스 구성:
+#   1. isaac-teleop    : CloudXR Runtime + WSS Proxy + 리타게팅 (GPU 필수)
+#   2. isaac-lab       : Isaac Lab 시뮬레이션 환경 (GPU 필수)
+#   3. webxr-client    : WebXR 클라이언트 (Meta Quest 3 브라우저 접속)
+#
+# 사용법:
+#   docker compose up -d          # 전체 실행
+#   docker compose logs -f        # 로그 확인
+#   docker compose down           # 종료
+###############################################################################
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Isaac Teleop – CloudXR Runtime + WSS Proxy + 리타게팅 (GPU 필수)
+  #    python -m isaacteleop.cloudxr 가 내부적으로 다음을 모두 실행:
+  #      - CloudXR Runtime (네이티브, 포트 49100)
+  #      - WSS Proxy (포트 48322, SSL 터미네이션)
+  # ──────────────────────────────────────────────────────────────────────────
+  isaac-teleop:
+    build:
+      context: ./docker/isaac-teleop
+      dockerfile: Dockerfile
+      network: host
+      args:
+        ISAACTELEOP_VERSION: ${ISAACTELEOP_VERSION:-1.0.0}
+    image: isaac-teleop:local
+    container_name: isaac-teleop
+    hostname: isaac-teleop
+    stdin_open: true
+    tty: true
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        if [ -z "$$NV_CXR_ENDPOINT_IP" ]; then
+          export NV_CXR_ENDPOINT_IP=$$(hostname -I | awk '{print $$1}')
+          echo "[isaac-teleop] CXR_PUBLIC_IP 미설정 → 로컬 IP 사용: $$NV_CXR_ENDPOINT_IP"
+        fi
+        echo '[isaac-teleop] CloudXR Runtime + WSS Proxy 시작 중...'
+        python -m isaacteleop.cloudxr --accept-eula --cloudxr-install-dir /openxr &
+        CXR_PID=$$!
+        sleep 5
+        chmod -R 755 /openxr/run 2>/dev/null || true
+        chmod 666 /openxr/run/ipc_cloudxr 2>/dev/null || true
+        echo '[isaac-teleop] OpenXR IPC 소켓 권한 설정 완료'
+        wait $$CXR_PID
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, graphics, display]
+    network_mode: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NV_CXR_ENDPOINT_IP=${CXR_PUBLIC_IP:-}
+      - NV_CXR_MEDIA_PORT=47998
+      - NV_CXR_STREAMSDK_ENABLE_ICE=0
+      - NV_DEVICE_PROFILE=${NV_DEVICE_PROFILE:-auto-webrtc}
+      - NV_CXR_ENABLE_PUSH_DEVICES=${NV_CXR_ENABLE_PUSH_DEVICES:-false}
+    volumes:
+      - openxr-shared:/openxr
+      - /usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/nvidia_icd.json:ro
+      - /usr/share/egl/egl_external_platform.d:/usr/share/egl/egl_external_platform.d:ro
+      - ./workspace:/workspace/user:rw
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Isaac Lab – 로봇 시뮬레이션 (GPU 필수)
+  # ──────────────────────────────────────────────────────────────────────────
+  isaac-lab:
+    image: nvcr.io/nvidia/isaac-lab:${ISAAC_LAB_VERSION:-2.3.0}
+    container_name: isaac-lab
+    hostname: isaac-lab
+    stdin_open: true
+    tty: true
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo '[isaac-lab] 텔레오퍼레이션 시뮬레이션 시작 중...'
+        echo '[isaac-lab] 시뮬레이션 로딩 후 UI에서 AR 패널 → Start AR 클릭 필요'
+        ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
+            --task ${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0} \
+            --teleop_device ${TELEOP_DEVICE:-handtracking} \
+            --enable_pinocchio
+    environment:
+      - ACCEPT_EULA=Y
+      - PRIVACY_CONSENT=Y
+      - DISPLAY=${DISPLAY:-:1}
+      - XDG_RUNTIME_DIR=/openxr/run
+      - XR_RUNTIME_JSON=/openxr/openxr_cloudxr.json
+      - TELEOP_TASK=${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}
+      - TELEOP_DEVICE=${TELEOP_DEVICE:-handtracking}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - openxr-shared:/openxr
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro
+      - isaac-cache-kit:/isaac-sim/kit/cache
+      - isaac-cache-ov:/root/.cache/ov
+      - isaac-cache-pip:/root/.cache/pip
+      - isaac-cache-gl:/root/.cache/nvidia/GLCache
+      - isaac-cache-compute:/root/.nv/ComputeCache
+      - isaac-logs:/root/.nvidia-omniverse/logs
+      - isaac-data:/root/.local/share/ov/data
+      - isaac-lab-logs:/workspace/isaaclab/logs
+      - isaac-lab-data:/workspace/isaaclab/data_storage
+      - ./workspace:/workspace/user:rw
+    networks:
+      - teleop-net
+    ports:
+      - "${ISAAC_LAB_LIVESTREAM_PORT:-8211}:8211"
+    depends_on:
+      isaac-teleop:
+        condition: service_started
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. WebXR Client – 웹 기반 XR 클라이언트 (Meta Quest 3)
+  # ──────────────────────────────────────────────────────────────────────────
+  webxr-client:
+    build:
+      context: ./docker/webxr-client
+      dockerfile: Dockerfile
+      network: host
+    image: webxr-client:local
+    container_name: webxr-client
+    hostname: webxr-client
+    networks:
+      - teleop-net
+    ports:
+      - "${WEBXR_HTTP_PORT:-8090}:8080"
+      - "${WEBXR_HTTPS_PORT:-8453}:8443"
+    depends_on:
+      isaac-teleop:
+        condition: service_started
+
+# ──────────────────────────────────────────────────────────────────────────
+# Named Volumes
+# ──────────────────────────────────────────────────────────────────────────
+volumes:
+  openxr-shared:
+    driver: local
+  isaac-cache-kit:
+  isaac-cache-ov:
+  isaac-cache-pip:
+  isaac-cache-gl:
+  isaac-cache-compute:
+  isaac-logs:
+  isaac-data:
+  isaac-lab-logs:
+  isaac-lab-data:
+
+# ──────────────────────────────────────────────────────────────────────────
+# Network
+# ──────────────────────────────────────────────────────────────────────────
+networks:
+  teleop-net:
+    driver: bridge

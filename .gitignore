@@ -1,0 +1,6 @@
+workspace/
+*.log
+.container.cfg
+docker/webxr-client/certs/
+.env
+images
