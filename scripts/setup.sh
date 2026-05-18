@@ -67,22 +67,6 @@ check_prereqs() {
         log "NVIDIA Container Toolkit: OK"
     fi
 
-    # Container Toolkit 버전 확인 (1.17+ 필수)
-    if command -v nvidia-ctk &>/dev/null; then
-        local ctk_ver
-        ctk_ver=$(nvidia-ctk --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
-        local ctk_major ctk_minor
-        ctk_major=$(echo "$ctk_ver" | cut -d. -f1)
-        ctk_minor=$(echo "$ctk_ver" | cut -d. -f2)
-        if [ "${ctk_major:-0}" -lt 1 ] || { [ "${ctk_major:-0}" -eq 1 ] && [ "${ctk_minor:-0}" -lt 17 ]; }; then
-            err "NVIDIA Container Toolkit ${ctk_ver} → 1.17 이상 필요 (Vulkan/EGL 드라이버 마운트)"
-            err "  → sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit"
-            ok=false
-        else
-            log "NVIDIA Container Toolkit: v${ctk_ver}"
-        fi
-    fi
-
     if [ "$ok" = false ]; then
         echo ""
         err "사전 요구사항을 충족하지 못했습니다. 위의 안내를 따라 설치해 주세요."
@@ -93,28 +77,7 @@ check_prereqs() {
     log "모든 사전 요구사항 충족!"
 }
 
-# ── 2. Docker nvidia 런타임 설정 ──────────────────────────────────────────
-setup_nvidia_runtime() {
-    info "Docker nvidia 런타임 확인 중..."
-
-    if docker info 2>/dev/null | grep -q "nvidia"; then
-        log "Docker nvidia 런타임: 등록됨"
-    else
-        warn "Docker nvidia 런타임이 등록되어 있지 않습니다. 자동 설정합니다..."
-        sudo nvidia-ctk runtime configure --runtime=docker
-        sudo systemctl restart docker
-
-        if docker info 2>/dev/null | grep -q "nvidia"; then
-            log "Docker nvidia 런타임: 설정 완료"
-        else
-            err "nvidia 런타임 자동 설정에 실패했습니다."
-            err "  수동 설정: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"
-            exit 1
-        fi
-    fi
-}
-
-# ── 3. 방화벽 포트 설정 ───────────────────────────────────────────────────
+# ── 2. 방화벽 포트 설정 ───────────────────────────────────────────────────
 setup_firewall() {
     info "방화벽 포트 설정 중 (Meta Quest 3 WebXR 연결용)..."
 
@@ -134,7 +97,7 @@ setup_firewall() {
     fi
 }
 
-# ── 4. 환경 변수 설정 ─────────────────────────────────────────────────────
+# ── 3. 환경 변수 설정 ─────────────────────────────────────────────────────
 setup_env() {
     info "환경 변수 확인 중..."
 
@@ -155,7 +118,7 @@ setup_env() {
     fi
 }
 
-# ── 5. X11 포워딩 ────────────────────────────────────────────────────────
+# ── 4. X11 포워딩 ────────────────────────────────────────────────────────
 setup_x11() {
     info "X11 포워딩 설정 중..."
     if command -v xhost &>/dev/null; then
@@ -166,14 +129,29 @@ setup_x11() {
     fi
 }
 
-# ── 6. 작업 디렉터리 생성 ─────────────────────────────────────────────────
+# ── 5. 작업 디렉터리 생성 ─────────────────────────────────────────────────
 setup_dirs() {
     info "작업 디렉터리 생성 중..."
-    mkdir -p "$PROJECT_DIR/workspace"
-    log "workspace/ 디렉터리 생성 완료"
+    mkdir -p "$PROJECT_DIR/workspace" "$PROJECT_DIR/assets"
+    log "workspace/, assets/ 디렉터리 생성 완료"
 }
 
-# ── 7. Docker 이미지 풀 ──────────────────────────────────────────────────
+# ── 5-1. 로봇 USD 에셋 다운로드 (최초 1회) ────────────────────────────────
+download_robot_assets() {
+    info "로봇 USD 에셋 확인 중..."
+    if [ -f "$PROJECT_DIR/assets/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd" ] \
+        && [ -f "$PROJECT_DIR/assets/Isaac/Props/PackingTable/packing_table.usd" ]; then
+        log "Nucleus 에셋 이미 존재 (스킵)"
+    else
+        info "GR1T2 USD 에셋 다운로드 중 (최초 1회, 이후 오프라인 사용 가능)..."
+        bash "$SCRIPT_DIR/download_assets.sh" || {
+            warn "에셋 다운로드 실패. 나중에 수동으로 실행하세요:"
+            warn "  ./scripts/download_assets.sh"
+        }
+    fi
+}
+
+# ── 6. Docker 이미지 풀 ──────────────────────────────────────────────────
 pull_images() {
     info "NGC 이미지 다운로드 중 (시간이 걸릴 수 있습니다)..."
     echo ""
@@ -187,7 +165,7 @@ pull_images() {
     # CloudXR Runtime은 isaac-teleop 이미지에 포함되어 별도 풀 불필요
 }
 
-# ── 8. 커스텀 이미지 빌드 ─────────────────────────────────────────────────
+# ── 7. 커스텀 이미지 빌드 ─────────────────────────────────────────────────
 build_custom() {
     info "커스텀 Docker 이미지 빌드 중..."
     cd "$PROJECT_DIR"
@@ -216,11 +194,11 @@ build_custom() {
 # ── 메인 ──────────────────────────────────────────────────────────────────
 main() {
     check_prereqs
-    setup_nvidia_runtime
     setup_firewall
     setup_env
     setup_x11
     setup_dirs
+    download_robot_assets
     pull_images
     build_custom
 

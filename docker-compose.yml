@@ -79,15 +79,8 @@ services:
     hostname: isaac-lab
     stdin_open: true
     tty: true
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        echo '[isaac-lab] 텔레오퍼레이션 시뮬레이션 시작 중...'
-        echo '[isaac-lab] 시뮬레이션 로딩 후 UI에서 AR 패널 → Start AR 클릭 필요'
-        ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
-            --task ${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0} \
-            --teleop_device ${TELEOP_DEVICE:-handtracking} \
-            --enable_pinocchio
+    entrypoint: ["/bin/bash"]
+    command: ["/workspace/user/scripts/isaac_lab_entrypoint.sh"]
     environment:
       - ACCEPT_EULA=Y
       - PRIVACY_CONSENT=Y
@@ -117,6 +110,8 @@ services:
       - isaac-lab-logs:/workspace/isaaclab/logs
       - isaac-lab-data:/workspace/isaaclab/data_storage
       - ./workspace:/workspace/user:rw
+      - ./assets:/workspace/user/assets:rw
+      - ./scripts/isaac_lab_entrypoint.sh:/workspace/user/scripts/isaac_lab_entrypoint.sh:ro
     networks:
       - teleop-net
     ports:
