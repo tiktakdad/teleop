@@ -8,6 +8,7 @@ set -euo pipefail
 ASSETS="/workspace/user/assets"
 FOURIER_PY="/workspace/isaaclab/source/isaaclab_assets/isaaclab_assets/robots/fourier.py"
 PICKPLACE_CFG="/workspace/isaaclab/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/pick_place/pickplace_gr1t2_env_cfg.py"
+RETARGETING_PY="/workspace/isaaclab/source/isaaclab/isaaclab/devices/openxr/retargeters/humanoid/fourier/gr1_t2_dex_retargeting_utils.py"
 
 echo "[isaac-lab] 텔레오퍼레이션 시뮬레이션 시작 중..."
 
@@ -80,13 +81,26 @@ patch_usd_path "$PICKPLACE_CFG" \
 patch_ground_plane "$PICKPLACE_CFG" \
     "${ASSETS}/Isaac/Environments/Grid/default_environment.usd" || true
 
+# GR1T2 핸드트래킹 리타게팅 URDF (teleop device 생성 시 필요)
+patch_usd_path "$RETARGETING_PY" \
+    'f"{ISAACLAB_NUCLEUS_DIR}/Mimic/GR1T2_assets/GR1_T2_left_hand.urdf"' \
+    "${ASSETS}/Isaac/IsaacLab/Mimic/GR1T2_assets/GR1_T2_left_hand.urdf" \
+    "GR1T2 left hand URDF" || true
+
+patch_usd_path "$RETARGETING_PY" \
+    'f"{ISAACLAB_NUCLEUS_DIR}/Mimic/GR1T2_assets/GR1_T2_right_hand.urdf"' \
+    "${ASSETS}/Isaac/IsaacLab/Mimic/GR1T2_assets/GR1_T2_right_hand.urdf" \
+    "GR1T2 right hand URDF" || true
+
 # 누락 에셋 안내
 missing=false
 for f in \
     "${ASSETS}/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd" \
     "${ASSETS}/Isaac/Props/PackingTable/packing_table.usd" \
     "${ASSETS}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" \
-    "${ASSETS}/Isaac/Environments/Grid/default_environment.usd"
+    "${ASSETS}/Isaac/Environments/Grid/default_environment.usd" \
+    "${ASSETS}/Isaac/IsaacLab/Mimic/GR1T2_assets/GR1_T2_left_hand.urdf" \
+    "${ASSETS}/Isaac/IsaacLab/Mimic/GR1T2_assets/GR1_T2_right_hand.urdf"
 do
     if [[ ! -f "$f" ]]; then
         echo "[isaac-lab] ! 없음: $f"

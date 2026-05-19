@@ -21,6 +21,7 @@ ASSET_BUNDLES=(
     "Props/PackingTable|Isaac/Props/PackingTable"
     "IsaacLab/Mimic/pick_place_task/pick_place_assets|Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets"
     "Environments/Grid|Isaac/Environments/Grid"
+    "IsaacLab/Mimic/GR1T2_assets|Isaac/IsaacLab/Mimic/GR1T2_assets"
 )
 
 CURL_OPTS=(-fsSL --retry 3 --connect-timeout 60)
@@ -46,6 +47,7 @@ PickPlace GR1T2 텔레오프에 필요한 Nucleus 에셋을 로컬에 저장합�
   - GR1T2 로봇
   - PackingTable (작업대)
   - steering_wheel 등 pick_place 에셋
+  - GR1T2 손 URDF (핸드트래킹 리타게팅)
 
 옵션:
   --force         이미 받은 파일도 다시 다운로드
@@ -155,7 +157,9 @@ is_complete() {
     [[ -f "${ASSETS_DIR}/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd" ]] \
         && [[ -f "${ASSETS_DIR}/Isaac/Props/PackingTable/packing_table.usd" ]] \
         && [[ -f "${ASSETS_DIR}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" ]] \
-        && [[ -f "${ASSETS_DIR}/Isaac/Environments/Grid/default_environment.usd" ]]
+        && [[ -f "${ASSETS_DIR}/Isaac/Environments/Grid/default_environment.usd" ]] \
+        && [[ -f "${ASSETS_DIR}/Isaac/IsaacLab/Mimic/GR1T2_assets/GR1_T2_left_hand.urdf" ]] \
+        && [[ -f "${ASSETS_DIR}/Isaac/IsaacLab/Mimic/GR1T2_assets/GR1_T2_right_hand.urdf" ]]
 }
 
 main() {
@@ -190,6 +194,7 @@ main() {
         log "  테이블: assets/Isaac/Props/PackingTable/"
         log "  물체:  assets/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/"
         log "  바닥:  assets/Isaac/Environments/Grid/"
+        log "  손 URDF: assets/Isaac/IsaacLab/Mimic/GR1T2_assets/"
         du -sh "$ASSETS_DIR" | awk '{print "  총 용량: " $1}'
     else
         err "필수 파일 누락. --force 로 재실행하세요."
