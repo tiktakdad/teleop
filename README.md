@@ -136,8 +136,11 @@ Quest 3 브라우저에서 아래 순서대로 진행합니다:
 | `CXR_PUBLIC_IP` | `220.74.41.204` | 서버 공인 IP (Quest에서 접속하는 주소) |
 | `NV_DEVICE_PROFILE` | `auto-webrtc` | 디바이스 프로필 (`auto-webrtc`: Quest/Pico WebXR, `auto-native`: Apple Vision Pro) |
 | `NV_CXR_ENABLE_PUSH_DEVICES` | `false` | `false`: 헤드셋 광학 핸드트래킹, `true`: 외부 디바이스 (Manus 글러브) |
+| `RUN_MODE` | `teleop` | 실행 모드 (`teleop`: 조작, `record`: 데이터 수집) |
 | `TELEOP_TASK` | `Isaac-PickPlace-GR1T2-Abs-v0` | 텔레옵 시뮬레이션 태스크 |
 | `TELEOP_DEVICE` | `handtracking` | 입력 장치 (`handtracking` / `keyboard` / `spacemouse`) |
+| `NUM_DEMOS` | `10` | [수집 모드] 기록할 데모 수 |
+| `DATASET_FILE` | `/workspace/user/datasets/dataset.hdf5` | [수집 모드] 저장될 HDF5 파일 경로 |
 | `ISAAC_LAB_VERSION` | `2.3.0` | Isaac Lab 이미지 버전 |
 | `WEBXR_HTTPS_PORT` | `8453` | WebXR 클라이언트 HTTPS 포트 |
 | `DISPLAY` | `:1` | X11 디스플레이 번호 |

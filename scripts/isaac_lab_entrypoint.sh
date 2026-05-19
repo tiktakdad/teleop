@@ -72,7 +72,30 @@ fi
 echo "[isaac-lab] 시뮬레이션 로딩 후 UI에서 AR 패널 → Start AR 클릭 필요"
 
 cd /workspace/isaaclab
-exec ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
-    --task "${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}" \
-    --teleop_device "${TELEOP_DEVICE:-handtracking}" \
-    --enable_pinocchio
+
+RUN_MODE="${RUN_MODE:-teleop}"
+if [ "$RUN_MODE" = "record" ]; then
+    echo "[isaac-lab] 🔴 데이터 수집 모드 (record_demos.py) 실행"
+    DATASET_DIR="/workspace/user/datasets"
+    mkdir -p "$DATASET_DIR"
+    
+    exec ./isaaclab.sh -p scripts/tools/record_demos.py \
+        --task "${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}" \
+        --teleop_device "${TELEOP_DEVICE:-handtracking}" \
+        --dataset_file "${DATASET_FILE:-$DATASET_DIR/dataset.hdf5}" \
+        --num_demos "${NUM_DEMOS:-10}" \
+        --enable_pinocchio \
+        --xr
+elif [ "$RUN_MODE" = "teleop" ]; then
+    echo "[isaac-lab] 🟢 단순 텔레옵 모드 (teleop_se3_agent.py) 실행"
+    exec ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py \
+        --task "${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}" \
+        --teleop_device "${TELEOP_DEVICE:-handtracking}" \
+        --enable_pinocchio
+else
+    echo "[isaac-lab] 🟡 커스텀 스크립트 모드: $RUN_MODE"
+    exec ./isaaclab.sh -p "$RUN_MODE" \
+        --task "${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}" \
+        --teleop_device "${TELEOP_DEVICE:-handtracking}" \
+        --enable_pinocchio
+fi
