@@ -20,6 +20,7 @@ ASSET_BUNDLES=(
     "Robots/FourierIntelligence/GR-1/GR1T2_fourier_hand_6dof|GR1T2_fourier_hand_6dof"
     "Props/PackingTable|Isaac/Props/PackingTable"
     "IsaacLab/Mimic/pick_place_task/pick_place_assets|Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets"
+    "Environments/Grid|Isaac/Environments/Grid"
 )
 
 CURL_OPTS=(-fsSL --retry 3 --connect-timeout 60)
@@ -153,7 +154,8 @@ download_bundle() {
 is_complete() {
     [[ -f "${ASSETS_DIR}/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd" ]] \
         && [[ -f "${ASSETS_DIR}/Isaac/Props/PackingTable/packing_table.usd" ]] \
-        && [[ -f "${ASSETS_DIR}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" ]]
+        && [[ -f "${ASSETS_DIR}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" ]] \
+        && [[ -f "${ASSETS_DIR}/Isaac/Environments/Grid/default_environment.usd" ]]
 }
 
 main() {
@@ -187,6 +189,7 @@ main() {
         log "  로봇:  assets/GR1T2_fourier_hand_6dof/"
         log "  테이블: assets/Isaac/Props/PackingTable/"
         log "  물체:  assets/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/"
+        log "  바닥:  assets/Isaac/Environments/Grid/"
         du -sh "$ASSETS_DIR" | awk '{print "  총 용량: " $1}'
     else
         err "필수 파일 누락. --force 로 재실행하세요."
