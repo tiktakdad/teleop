@@ -92,6 +92,10 @@ services:
       - DATASET_FILE=${DATASET_FILE:-/workspace/user/datasets/dataset.hdf5}
       - TELEOP_TASK=${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}
       - TELEOP_DEVICE=${TELEOP_DEVICE:-handtracking}
+      - XR_HEADLESS=${XR_HEADLESS:-false}
+      - ROBOT_CAM_WIDTH=${ROBOT_CAM_WIDTH:-256}
+      - ROBOT_CAM_HEIGHT=${ROBOT_CAM_HEIGHT:-160}
+      - HIDE_HAND_MARKERS_IN_RECORD=${HIDE_HAND_MARKERS_IN_RECORD:-1}
     deploy:
       resources:
         reservations:
@@ -114,7 +118,7 @@ services:
       - isaac-lab-data:/workspace/isaaclab/data_storage
       - ./workspace:/workspace/user:rw
       - ./assets:/workspace/user/assets:rw
-      - ./scripts/isaac_lab_entrypoint.sh:/workspace/user/scripts/isaac_lab_entrypoint.sh:ro
+      - ./scripts:/workspace/user/scripts:ro
     networks:
       - teleop-net
     ports:

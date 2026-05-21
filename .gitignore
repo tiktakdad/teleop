@@ -5,3 +5,4 @@ assets/
 docker/webxr-client/certs/
 .env
 images
+output
