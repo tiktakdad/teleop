@@ -6,6 +6,10 @@ set -euo pipefail
 ###############################################################################
 
 ASSETS="/workspace/user/assets"
+CUSTOM_ASSETS="${CUSTOM_ASSETS_DIR:-/workspace/user/custom_assets}"
+CUSTOM_TASKS="/workspace/user/scripts/custom_tasks"
+export CUSTOM_ASSETS_DIR="${CUSTOM_ASSETS}"
+export PYTHONPATH="${CUSTOM_TASKS}:${PYTHONPATH:-}"
 LOCO_G1_CFG="/workspace/isaaclab/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomanipulation/pick_place/locomanipulation_g1_env_cfg.py"
 FIXED_G1_CFG="/workspace/isaaclab/source/isaaclab_tasks/isaaclab_tasks/manager_based/locomanipulation/pick_place/fixed_base_upper_body_ik_g1_env_cfg.py"
 UNITREE_PY="/workspace/isaaclab/source/isaaclab_assets/isaaclab_assets/robots/unitree.py"
@@ -90,6 +94,34 @@ patch_ground_plane "$PICKPLACE_CFG" "${ASSETS}/Isaac/Environments/Grid/default_e
 TELEOP_TASK="${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}"
 RUN_MODE="${RUN_MODE:-teleop}"
 
+is_barcode_ffw_task() {
+    [[ "$TELEOP_TASK" == *BarcodePress-FFW* ]]
+}
+
+# 🔹 custom asset 태스크 — 서버랙 USD reference 수리
+if is_barcode_ffw_task || [[ -d "${CUSTOM_TASKS}/teleop_barcode_press" ]]; then
+    TELEOP_USD="${CUSTOM_ASSETS}/env/server_rack_v6.1/server_rack_teleop.usd"
+    SOURCE_USD="${CUSTOM_ASSETS}/env/server_rack_v6.1/Server_Rack/server_rack_v5/configuration/server_rack_v5_base.usd"
+    if [[ -f "$TELEOP_USD" ]] && [[ ! -f "$SOURCE_USD" || ( "$TELEOP_USD" -nt "$SOURCE_USD" && /workspace/user/scripts/repair_server_rack_usd.py -nt "$SOURCE_USD" ) ]]; then
+        echo "[isaac-lab] ✓ server_rack_teleop.usd 사용 (기존)"
+    elif command -v python3 >/dev/null && python3 /workspace/user/scripts/repair_server_rack_usd.py "${CUSTOM_ASSETS}"; then
+        echo "[isaac-lab] ✓ server_rack_teleop.usd 생성 완료"
+    elif [[ -f "$TELEOP_USD" ]]; then
+        echo "[isaac-lab] ✓ server_rack_teleop.usd 사용 (수리 스킵)"
+    else
+        echo "[isaac-lab] ! server_rack_teleop.usd 없음 — 호스트에서 repair_server_rack_usd.py 실행"
+    fi
+fi
+
+# 🔹 custom asset 태스크 등록 (gym id)
+if [[ -d "${CUSTOM_TASKS}/teleop_barcode_press" ]]; then
+    if [[ -f "${CUSTOM_ASSETS}/robot/ai_worker/FFW_SG2.usd" && -f "${CUSTOM_ASSETS}/env/server_rack_v6.1/server_rack_teleop.usd" ]]; then
+        echo "[isaac-lab] ✓ custom task: Isaac-BarcodePress-FFW-SG2-Abs-v0"
+    else
+        echo "[isaac-lab] ! custom_assets 미비 — FFW_SG2 / server_rack_teleop.usd 확인"
+    fi
+fi
+
 # 🔹 G1 텔레옵 수집: 로봇 POV 카메라 → HDF5 obs/robot_pov_cam
 is_g1_task() {
     [[ "$TELEOP_TASK" == *G1* ]] || [[ "$TELEOP_TASK" == *Locomanipulation* ]]
@@ -163,16 +195,25 @@ if [[ "$RUN_MODE" == "record" ]]; then
         RECORD_ARGS+=(--enable_cameras)
         echo "[isaac-lab]   G1 로봇 POV: --enable_cameras (obs/robot_pov_cam → HDF5)"
     fi
+    if is_barcode_ffw_task; then
+        RECORD_ARGS+=(--enable_cameras)
+        echo "[isaac-lab]   FFW 양손 cam: --enable_cameras (obs/left_hand_cam, obs/right_hand_cam → HDF5)"
+    fi
 
     exec ./isaaclab.sh -p scripts/tools/record_demos.py "${RECORD_ARGS[@]}"
 elif [[ "$RUN_MODE" == "teleop" ]]; then
-    echo "[isaac-lab] 🟢 텔레옵 (teleop_se3_agent.py)"
     TELEOP_ARGS=("${COMMON_ARGS[@]}")
-    # handtracking이면 스크립트가 내부적으로 xr=True 설정; 명시적 --xr는 headless kit 선택에도 사용
     if [[ "${TELEOP_DEVICE:-handtracking}" == *handtracking* ]]; then
         TELEOP_ARGS+=(--xr)
     fi
-    exec ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py "${TELEOP_ARGS[@]}"
+    if is_barcode_ffw_task; then
+        TELEOP_ARGS+=(--enable_cameras)
+        echo "[isaac-lab] 🟢 텔레옵 — FFW_SG2 바코드 프레스 (teleop_barcode_ffw.py, hand cam ON)"
+        exec ./isaaclab.sh -p /workspace/user/scripts/teleop_barcode_ffw.py "${TELEOP_ARGS[@]}"
+    else
+        echo "[isaac-lab] 🟢 텔레옵 (teleop_se3_agent.py)"
+        exec ./isaaclab.sh -p scripts/environments/teleoperation/teleop_se3_agent.py "${TELEOP_ARGS[@]}"
+    fi
 else
     echo "[isaac-lab] 🟡 커스텀: $RUN_MODE"
     exec ./isaaclab.sh -p "$RUN_MODE" "${COMMON_ARGS[@]}"

@@ -1,8 +1,39 @@
+# 🔹 Isaac Sim / Isaac Lab 및 로컬 데이터 영역
 workspace/
 assets/
-*.log
+custom_assets/
+output/
+images/
+
+# 🔹 로컬 설정 및 비밀 환경 변수
+.env
+.env.local
+.env.*.local
+!.env.example
 .container.cfg
 docker/webxr-client/certs/
-.env
-images
-output
+
+# 🔹 빌드 및 캐시 / 로그 파일
+*.log
+_build/
+build/
+dist/
+
+# 🔹 파이썬 컴파일 및 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+
+# 🔹 IDE 및 에디터 설정 파일
+.vscode/
+.idea/
+*.swp
+*~
+
+# 🔹 운영체제 임시 파일
+.DS_Store
+Thumbs.db
+desktop.ini

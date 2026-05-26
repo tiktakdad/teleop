@@ -81,6 +81,8 @@ services:
     tty: true
     entrypoint: ["/bin/bash"]
     command: ["/workspace/user/scripts/isaac_lab_entrypoint.sh"]
+    env_file:
+      - .env
     environment:
       - ACCEPT_EULA=Y
       - PRIVACY_CONSENT=Y
@@ -92,6 +94,7 @@ services:
       - DATASET_FILE=${DATASET_FILE:-/workspace/user/datasets/dataset.hdf5}
       - TELEOP_TASK=${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}
       - TELEOP_DEVICE=${TELEOP_DEVICE:-handtracking}
+      - CUSTOM_ASSETS_DIR=/workspace/user/custom_assets
       - XR_HEADLESS=${XR_HEADLESS:-false}
       - ROBOT_CAM_WIDTH=${ROBOT_CAM_WIDTH:-256}
       - ROBOT_CAM_HEIGHT=${ROBOT_CAM_HEIGHT:-160}
@@ -118,6 +121,7 @@ services:
       - isaac-lab-data:/workspace/isaaclab/data_storage
       - ./workspace:/workspace/user:rw
       - ./assets:/workspace/user/assets:rw
+      - ./custom_assets:/workspace/user/custom_assets:ro
       - ./scripts:/workspace/user/scripts:ro
     networks:
       - teleop-net
