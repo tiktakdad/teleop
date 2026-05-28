@@ -205,6 +205,7 @@ Quest 3 브라우저에서 아래 순서대로 진행합니다:
 | `TELEOP_TASK` | `Isaac-PickPlace-GR1T2-Abs-v0` | 텔레옵 시뮬레이션 태스크 |
 | `TELEOP_DEVICE` | `handtracking` | 입력 장치 (`handtracking` / `keyboard` / `spacemouse`) |
 | `XR_HEADLESS` | `false` | `true`: `--headless --xr`로 Start AR 자동 시작 (원격 서버 권장) |
+| `RECORD_FPS` | | [수집 모드] HDF5 저장 주파수. Robotis AI Worker dataset/policy 권장값: `15` |
 | `NUM_DEMOS` | `10` | [수집 모드] 기록할 데모 수 |
 | `DATASET_FILE` | `/workspace/user/datasets/dataset.hdf5` | [수집 모드] 저장될 HDF5 파일 경로 |
 | `ISAAC_LAB_VERSION` | `2.3.0` | Isaac Lab 이미지 버전 |

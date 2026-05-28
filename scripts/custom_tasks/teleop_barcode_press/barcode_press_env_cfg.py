@@ -244,7 +244,8 @@ class ActionsCfg:
 
     upper_body_ik = PinkInverseKinematicsActionCfg(
         pink_controlled_joint_names=[f"arm_{side}_joint{i}" for side in ("l", "r") for i in range(1, 8)],
-        hand_joint_names=[f"gripper_{side}_joint{i}" for side in ("l", "r") for i in range(1, 5)],
+        # FFW gripper joints 2-4 mimic joint1 in USD, so teleop should only command each master joint.
+        hand_joint_names=["gripper_l_joint1", "gripper_r_joint1"],
         target_eef_link_names={
             "left_wrist": FFW_LEFT_EE_LINK,
             "right_wrist": FFW_RIGHT_EE_LINK,
@@ -253,7 +254,7 @@ class ActionsCfg:
         controller=PinkIKControllerCfg(
             articulation_name="robot",
             base_link_name=FFW_BASE_LINK,
-            num_hand_joints=8,
+            num_hand_joints=2,
             show_ik_warnings=False,
             fail_on_joint_limit_violation=False,
             variable_input_tasks=[
@@ -393,9 +394,11 @@ class BarcodePressFFWSG2EnvCfg(ManagerBasedRLEnvCfg):
     idle_action = torch.zeros(22)
 
     def __post_init__(self):
-        self.decimation = 6
+        # Robotis AI Worker: 100 Hz low-level joint loop, 15 Hz dataset/policy FPS.
+        # Keep env control at 50 Hz for teleop responsiveness; RECORD_FPS throttles HDF5 samples to 15 Hz.
+        self.decimation = 2
         self.episode_length_s = 60.0
-        self.sim.dt = 1 / 120
+        self.sim.dt = 1 / 100
         self.sim.render_interval = 2
 
         temp_urdf_output_path, temp_urdf_meshes_output_path = ControllerUtils.convert_usd_to_urdf(

@@ -61,7 +61,7 @@ from teleop_barcode_press.utils.hand_cam_frustum_vis import HandCamFrustumVisual
 from teleop_barcode_press.utils.xr_task_hud import BarcodeXrHud
 
 FFW_EE_LINKS = ["arm_l_link7", "arm_r_link7"]
-FFW_HAND_JOINTS = [f"gripper_{side}_joint{i}" for side in ("l", "r") for i in range(1, 5)]
+FFW_HAND_JOINTS = ["gripper_l_joint1", "gripper_r_joint1"]
 
 
 def set_barcode_target_color(env, in_frame: bool) -> None:

@@ -35,13 +35,13 @@ usage() {
 
 예:
   $(basename "$0") workspace/datasets/dataset_g1_260520_0652.hdf5
-  $(basename "$0") workspace/datasets/foo.hdf5 --task "pick and place" --fps 50
+  $(basename "$0") workspace/datasets/foo.hdf5 --task "pick and place" --fps 15
 
 추가 인자는 convert_isaac_hdf5_to_lerobot.py 로 그대로 전달됩니다.
   --output-dir <path>   출력 경로 수동 지정 (기본: 자동)
   --repo-id <id>        LeRobot repo_id (기본: local/<파일명>)
   --task <text>         태스크 설명
-  --fps <hz>            FPS (기본: 50)
+  --fps <hz>            FPS (기본: 50, RECORD_FPS=15로 수집했다면 --fps 15)
   --push-to-hub         Hugging Face Hub 업로드
 
 환경:
@@ -61,6 +61,23 @@ fi
 
 HDF5_ARG="$1"
 shift
+
+HAS_FPS_ARG=0
+for arg in "$@"; do
+    case "$arg" in
+        --fps|--fps=*)
+            HAS_FPS_ARG=1
+            break
+            ;;
+    esac
+done
+
+if [[ "$HAS_FPS_ARG" -eq 0 && -f "$PROJECT_DIR/.env" ]]; then
+    ENV_RECORD_FPS="$(grep -E '^RECORD_FPS=' "$PROJECT_DIR/.env" | tail -n 1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+    if [[ -n "$ENV_RECORD_FPS" ]]; then
+        set -- "$@" --fps "$ENV_RECORD_FPS"
+    fi
+fi
 
 # 절대 경로로 정규화
 if [[ "$HDF5_ARG" = /* ]]; then

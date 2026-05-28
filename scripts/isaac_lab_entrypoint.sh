@@ -184,6 +184,95 @@ if [[ "$RUN_MODE" == "record" ]]; then
     fi
     echo "[isaac-lab]   저장 경로: $DATASET_FILE"
 
+    if [[ -n "${RECORD_FPS:-}" ]]; then
+        RECORD_DEMOS_PY="/workspace/isaaclab/scripts/tools/record_demos.py"
+        if grep -qF "# [teleop] RECORD_FPS env-step patch" "$RECORD_DEMOS_PY"; then
+            python3 - "$RECORD_DEMOS_PY" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old_marker = "    # [teleop] RECORD_FPS env-step patch"
+next_block = "    # extract success checking function"
+start = text.find(old_marker)
+if start != -1:
+    end = text.find(next_block, start)
+    if end == -1:
+        raise SystemExit("old RECORD_FPS env-step patch end marker not found")
+    text = text[:start] + text[end:]
+    path.write_text(text)
+PY
+            echo "[isaac-lab] ✓ old RECORD_FPS env-step patch removed"
+        fi
+        if grep -qF "# [teleop] RECORD_FPS recorder sampling patch" "$RECORD_DEMOS_PY"; then
+            :
+        elif grep -qF "    # Run simulation loop" "$RECORD_DEMOS_PY"; then
+            python3 - "$RECORD_DEMOS_PY" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+needle = "    # Run simulation loop"
+patch = '''    # [teleop] RECORD_FPS recorder sampling patch
+    record_fps = os.environ.get("RECORD_FPS", "").strip()
+    if record_fps:
+        try:
+            target_fps = float(record_fps)
+            if target_fps <= 0:
+                raise ValueError
+        except ValueError:
+            omni.log.error(f"Invalid RECORD_FPS={record_fps!r}. Use a positive number, e.g. 15.")
+            exit(1)
+
+        base_step_dt = float(env.step_dt)
+        if target_fps > (1.0 / base_step_dt) + 1e-6:
+            omni.log.error(
+                f"RECORD_FPS={target_fps:g} exceeds env step rate {1.0 / base_step_dt:g} Hz. "
+                "Use a lower value or increase the environment rate."
+            )
+            exit(1)
+
+        orig_record_pre_step = env.recorder_manager.record_pre_step
+        orig_record_post_step = env.recorder_manager.record_post_step
+        sample_state = {"step_index": 0, "next_t": 0.0, "record_this_step": False}
+        sample_dt = 1.0 / target_fps
+
+        def sampled_record_pre_step():
+            step_t = sample_state["step_index"] * base_step_dt
+            record_this_step = step_t + 0.5 * base_step_dt >= sample_state["next_t"] - 1e-9
+            sample_state["record_this_step"] = record_this_step
+            if record_this_step:
+                while sample_state["next_t"] <= step_t + 0.5 * base_step_dt + 1e-9:
+                    sample_state["next_t"] += sample_dt
+                return orig_record_pre_step()
+
+        def sampled_record_post_step():
+            try:
+                if sample_state["record_this_step"]:
+                    return orig_record_post_step()
+            finally:
+                sample_state["step_index"] += 1
+                sample_state["record_this_step"] = False
+
+        env.recorder_manager.record_pre_step = sampled_record_pre_step
+        env.recorder_manager.record_post_step = sampled_record_post_step
+        omni.log.info(
+            f"RECORD_FPS={target_fps:g}: recording samples at {target_fps:g} Hz while env control stays "
+            f"at {1.0 / base_step_dt:g} Hz (step_dt={base_step_dt:.6f}s)."
+        )
+
+'''
+path.write_text(text.replace(needle, patch + needle, 1))
+PY
+            echo "[isaac-lab] ✓ RECORD_FPS recorder sampling enabled: ${RECORD_FPS} Hz"
+        else
+            echo "[isaac-lab] ! RECORD_FPS patch 위치를 찾지 못함" >&2
+            exit 1
+        fi
+    fi
+
     RECORD_ARGS=("${COMMON_ARGS[@]}"
         --dataset_file "$DATASET_FILE"
         --num_demos "${NUM_DEMOS:-10}"

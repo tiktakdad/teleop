@@ -26,7 +26,7 @@ class FfwSg2RetargeterCfg(RetargeterCfg):
 
 
 class FfwSg2Retargeter(RetargeterBase):
-    """OpenXR 양손 트래킹 → FFW_SG2 양팔 EE + 그리퍼 joint (22D action)."""
+    """OpenXR 양손 트래킹 → FFW_SG2 양팔 EE + gripper master joints (16D action)."""
 
     def __init__(self, cfg: FfwSg2RetargeterCfg):
         self._enable_visualization = cfg.enable_visualization
@@ -88,9 +88,17 @@ class FfwSg2Retargeter(RetargeterBase):
                 scales=scales
             )
 
-        hand_joints = np.zeros(8, dtype=np.float32)
-        hand_joints[:4] = self._compute_gripper_joints(left_hand_poses)
-        hand_joints[4:8] = self._compute_gripper_joints(right_hand_poses)
+        left_gripper = self._compute_gripper_joint(left_hand_poses)
+        right_gripper = self._compute_gripper_joint(right_hand_poses)
+        hand_joints = np.array([left_gripper, right_gripper], dtype=np.float32)
+
+        if self._step_i % 60 == 0:
+            print(
+                "[ffw_retargeter][gripper] "
+                f"L={round(float(left_gripper), 3)} R={round(float(right_gripper), 3)} "
+                f"action={np.round(hand_joints, 3).tolist()}",
+                flush=True,
+            )
 
         left_wrist_tensor = torch.tensor(self._retarget_abs(left_wrist, side="left"), dtype=torch.float32, device=self._sim_device)
         right_wrist_tensor = torch.tensor(
@@ -100,16 +108,23 @@ class FfwSg2Retargeter(RetargeterBase):
 
         return torch.cat([left_wrist_tensor, right_wrist_tensor, hand_joints_tensor])
 
-    def _compute_gripper_joints(self, hand_poses: dict) -> np.ndarray:
+    def _compute_gripper_joint(self, hand_poses: dict) -> float:
         """엄지-검지 거리로 그리퍼 개폐 근사."""
         thumb = hand_poses.get("thumb_tip", hand_poses.get("thumb"))
         index = hand_poses.get("index_tip", hand_poses.get("index"))
+        wrist = hand_poses.get("wrist")
         if thumb is None or index is None:
-            return np.zeros(4, dtype=np.float32)
+            return 0.0
 
-        pinch_dist = float(np.linalg.norm(np.array(thumb[:3]) - np.array(index[:3])))
+        thumb_pos = np.array(thumb[:3], dtype=np.float32)
+        index_pos = np.array(index[:3], dtype=np.float32)
+        wrist_pos = np.array(wrist[:3], dtype=np.float32) if wrist is not None else np.zeros(3, dtype=np.float32)
+        if np.linalg.norm(wrist_pos) < 1.0e-5 and np.linalg.norm(thumb_pos) < 1.0e-5 and np.linalg.norm(index_pos) < 1.0e-5:
+            return 0.0
+
+        pinch_dist = float(np.linalg.norm(thumb_pos - index_pos))
         closed = np.clip(1.0 - pinch_dist / 0.08, 0.0, 1.0) * _GRIPPER_CLOSED_RAD
-        return np.full(4, closed, dtype=np.float32)
+        return float(closed)
 
     def _retarget_abs(self, wrist: np.ndarray, side: str) -> np.ndarray:
         """OpenXR wrist → FFW_SG2 wrist control frame.

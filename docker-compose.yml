@@ -90,6 +90,7 @@ services:
       - XDG_RUNTIME_DIR=/openxr/run
       - XR_RUNTIME_JSON=/openxr/openxr_cloudxr.json
       - RUN_MODE=${RUN_MODE:-teleop}
+      - RECORD_FPS=${RECORD_FPS:-}
       - NUM_DEMOS=${NUM_DEMOS:-10}
       - DATASET_FILE=${DATASET_FILE:-/workspace/user/datasets/dataset.hdf5}
       - TELEOP_TASK=${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}

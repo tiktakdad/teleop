@@ -39,7 +39,7 @@ python -c "import lerobot; print(lerobot.__version__)"   # 예: 0.4.4
 | 인자 | 설명 |
 |------|------|
 | `--task "..."` | 태스크 설명 (기본: `pick and place steering wheel`) |
-| `--fps 50` | 제어 주파수 Hz |
+| `--fps 50` | 제어 주파수 Hz. `RECORD_FPS=15`로 수집했다면 `--fps 15` 지정 |
 | `--output-dir <path>` | 출력 경로 수동 지정 (기본: 자동) |
 | `--repo-id local/my_dataset` | LeRobot repo_id 수동 지정 |
 | `--push-to-hub` | Hugging Face Hub 업로드 |
