@@ -20,7 +20,7 @@ _IN_FRAME_KEY = "_barcode_cam_in_frame"
 _DEBUG_KEY = "_barcode_cam_debug"
 
 _USE_CONE = os.environ.get("BARCODE_USE_CONE", "1").lower() not in ("0", "false", "no")
-_CONE_HALF_ANGLE_DEG = float(os.environ.get("BARCODE_CONE_HALF_ANGLE_DEG", "35"))
+_CONE_HALF_ANGLE_DEG = float(os.environ.get("BARCODE_CONE_HALF_ANGLE_DEG", "45"))
 
 
 def _get_hold_tensor(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -118,30 +118,19 @@ def barcode_in_frame_mask(
 ) -> torch.Tensor:
     """바코드 타겟이 핸드 카메라 시야 안 (픽셀 또는 전방 콘)."""
     # 🔹 텔레옵 비활성화 상태에서는 바코드 인식을 원천적으로 False 처리하여 오동작 방지
-    if not getattr(env, "teleoperation_active", False):
-        empty = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-        setattr(env, _IN_FRAME_KEY, empty)
-        m = {
-            "valid": empty,
-            "fov_in": empty,
-            "pixel_in": empty,
-            "cone_in": empty,
-            "depth": torch.zeros(env.num_envs, device=env.device),
-            "u": torch.zeros(env.num_envs, device=env.device),
-            "v": torch.zeros(env.num_envs, device=env.device),
-            "dist": torch.zeros(env.num_envs, device=env.device),
-        }
-        setattr(env, _DEBUG_KEY, m)
-        hold_time = _get_hold_tensor(env)
-        hold_time.zero_()
-        return empty
-
+    # 🔹 텔레옵 비활성화 상태에서는 바코드 인식을 정상적으로 계산하여 디버깅/시각화에 반영하되,
+    # 타이머 누적만 0으로 리셋하여 오동작을 방지합니다.
     m = _compute_view_metrics(env, camera_cfg, target_cfg, margin_frac, min_depth, max_depth)
     in_frame = m["fov_in"]
     if _USE_CONE:
         in_frame = in_frame | m["cone_in"]
     setattr(env, _IN_FRAME_KEY, in_frame)
     setattr(env, _DEBUG_KEY, m)
+
+    if not getattr(env, "teleoperation_active", False):
+        hold_time = _get_hold_tensor(env)
+        hold_time.zero_()
+
     return in_frame
 
 
@@ -154,6 +143,12 @@ def update_barcode_cam_hold(
     """연속 인식 시간 누적. 반환: (성공 여부, 현재 홀드 시간 [s])."""
     dt = step_dt if step_dt is not None else env.step_dt
     hold_time = _get_hold_tensor(env)
+    
+    # 🔹 텔레옵이 활성화되지 않은 상태라면 홀드 타임을 누적하지 않고 0으로 리셋합니다.
+    if not getattr(env, "teleoperation_active", False):
+        hold_time.zero_()
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device), hold_time
+
     hold_time = torch.where(in_frame, hold_time + dt, torch.zeros_like(hold_time))
     setattr(env, _HOLD_TIME_KEY, hold_time)
     return hold_time >= hold_time_s, hold_time

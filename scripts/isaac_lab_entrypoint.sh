@@ -56,69 +56,67 @@ if [[ -f "${ASSETS}/.offline_ready" ]] || [[ -d "${ASSETS}/Isaac" ]]; then
     echo "[isaac-lab] ✓ 로컬 Nucleus 미러 (kit_args)"
 fi
 
-# 🔹 G1 / GR1T2 로컬 에셋 경로
-for g1_cfg in "$LOCO_G1_CFG" "$FIXED_G1_CFG"; do
-    patch_usd_path "$g1_cfg" \
+# Built-in G1 / GR1T2 path patches are unrelated to the custom FFW robot.
+if [[ "${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}" != *BarcodePress-FFW* ]]; then
+    for g1_cfg in "$LOCO_G1_CFG" "$FIXED_G1_CFG"; do
+        patch_usd_path "$g1_cfg" \
+            'f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd"' \
+            "${ASSETS}/Isaac/Props/PackingTable/packing_table.usd" "G1 PackingTable" || true
+        patch_usd_path "$g1_cfg" \
+            'f"{ISAACLAB_NUCLEUS_DIR}/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd"' \
+            "${ASSETS}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" "G1 steering_wheel" || true
+        patch_ground_plane "$g1_cfg" "${ASSETS}/Isaac/Environments/Grid/default_environment.usd" || true
+    done
+
+    patch_usd_path "$UNITREE_PY" \
+        'f"{ISAAC_NUCLEUS_DIR}/Robots/Unitree/G1/g1.usd"' \
+        "${ASSETS}/Isaac/Robots/Unitree/G1/g1.usd" "Unitree G1" || true
+
+    patch_usd_path "$G1_RETARGETING_PY" \
+        'f"{ISAACLAB_NUCLEUS_DIR}/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_left_hand.urdf"' \
+        "${ASSETS}/Isaac/IsaacLab/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_left_hand.urdf" \
+        "G1 left hand URDF" || true
+    patch_usd_path "$G1_RETARGETING_PY" \
+        'f"{ISAACLAB_NUCLEUS_DIR}/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_right_hand.urdf"' \
+        "${ASSETS}/Isaac/IsaacLab/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_right_hand.urdf" \
+        "G1 right hand URDF" || true
+
+    patch_usd_path "$FOURIER_PY" \
+        'f"{ISAAC_NUCLEUS_DIR}/Robots/FourierIntelligence/GR-1/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd"' \
+        "${ASSETS}/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd" "GR1T2" || true
+    patch_usd_path "$PICKPLACE_CFG" \
         'f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd"' \
-        "${ASSETS}/Isaac/Props/PackingTable/packing_table.usd" "G1 PackingTable" || true
-    patch_usd_path "$g1_cfg" \
+        "${ASSETS}/Isaac/Props/PackingTable/packing_table.usd" "PackingTable" || true
+    patch_usd_path "$PICKPLACE_CFG" \
         'f"{ISAACLAB_NUCLEUS_DIR}/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd"' \
-        "${ASSETS}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" "G1 steering_wheel" || true
-    patch_ground_plane "$g1_cfg" "${ASSETS}/Isaac/Environments/Grid/default_environment.usd" || true
-done
-
-patch_usd_path "$UNITREE_PY" \
-    'f"{ISAAC_NUCLEUS_DIR}/Robots/Unitree/G1/g1.usd"' \
-    "${ASSETS}/Isaac/Robots/Unitree/G1/g1.usd" "Unitree G1" || true
-
-patch_usd_path "$G1_RETARGETING_PY" \
-    'f"{ISAACLAB_NUCLEUS_DIR}/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_left_hand.urdf"' \
-    "${ASSETS}/Isaac/IsaacLab/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_left_hand.urdf" \
-    "G1 left hand URDF" || true
-patch_usd_path "$G1_RETARGETING_PY" \
-    'f"{ISAACLAB_NUCLEUS_DIR}/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_right_hand.urdf"' \
-    "${ASSETS}/Isaac/IsaacLab/Controllers/LocomanipulationAssets/unitree_g1_dexpilot_asset/G1_right_hand.urdf" \
-    "G1 right hand URDF" || true
-
-patch_usd_path "$FOURIER_PY" \
-    'f"{ISAAC_NUCLEUS_DIR}/Robots/FourierIntelligence/GR-1/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd"' \
-    "${ASSETS}/GR1T2_fourier_hand_6dof/GR1T2_fourier_hand_6dof.usd" "GR1T2" || true
-patch_usd_path "$PICKPLACE_CFG" \
-    'f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd"' \
-    "${ASSETS}/Isaac/Props/PackingTable/packing_table.usd" "PackingTable" || true
-patch_usd_path "$PICKPLACE_CFG" \
-    'f"{ISAACLAB_NUCLEUS_DIR}/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd"' \
-    "${ASSETS}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" "steering_wheel" || true
-patch_ground_plane "$PICKPLACE_CFG" "${ASSETS}/Isaac/Environments/Grid/default_environment.usd" || true
+        "${ASSETS}/Isaac/IsaacLab/Mimic/pick_place_task/pick_place_assets/steering_wheel.usd" "steering_wheel" || true
+    patch_ground_plane "$PICKPLACE_CFG" "${ASSETS}/Isaac/Environments/Grid/default_environment.usd" || true
+fi
 
 TELEOP_TASK="${TELEOP_TASK:-Isaac-PickPlace-GR1T2-Abs-v0}"
 RUN_MODE="${RUN_MODE:-teleop}"
+
+# Previous configurations may still pass the unversioned ID, but Gym registers -v0.
+if [[ "$TELEOP_TASK" == "Isaac-BarcodePress-FFW-SG2-Abs" ]]; then
+    TELEOP_TASK="${TELEOP_TASK}-v0"
+    echo "[isaac-lab] task id normalized: ${TELEOP_TASK}"
+fi
 
 is_barcode_ffw_task() {
     [[ "$TELEOP_TASK" == *BarcodePress-FFW* ]]
 }
 
-# 🔹 custom asset 태스크 — 서버랙 USD reference 수리
-if is_barcode_ffw_task || [[ -d "${CUSTOM_TASKS}/teleop_barcode_press" ]]; then
-    TELEOP_USD="${CUSTOM_ASSETS}/env/server_rack_v6.1/server_rack_teleop.usd"
-    SOURCE_USD="${CUSTOM_ASSETS}/env/server_rack_v6.1/Server_Rack/server_rack_v5/configuration/server_rack_v5_base.usd"
-    if [[ -f "$TELEOP_USD" ]] && [[ ! -f "$SOURCE_USD" || ( "$TELEOP_USD" -nt "$SOURCE_USD" && /workspace/user/scripts/repair_server_rack_usd.py -nt "$SOURCE_USD" ) ]]; then
-        echo "[isaac-lab] ✓ server_rack_teleop.usd 사용 (기존)"
-    elif command -v python3 >/dev/null && python3 /workspace/user/scripts/repair_server_rack_usd.py "${CUSTOM_ASSETS}"; then
-        echo "[isaac-lab] ✓ server_rack_teleop.usd 생성 완료"
-    elif [[ -f "$TELEOP_USD" ]]; then
-        echo "[isaac-lab] ✓ server_rack_teleop.usd 사용 (수리 스킵)"
-    else
-        echo "[isaac-lab] ! server_rack_teleop.usd 없음 — 호스트에서 repair_server_rack_usd.py 실행"
-    fi
-fi
-
 # 🔹 custom asset 태스크 등록 (gym id)
-if [[ -d "${CUSTOM_TASKS}/teleop_barcode_press" ]]; then
-    if [[ -f "${CUSTOM_ASSETS}/robot/ai_worker/FFW_SG2.usd" && -f "${CUSTOM_ASSETS}/env/server_rack_v6.1/server_rack_teleop.usd" ]]; then
-        echo "[isaac-lab] ✓ custom task: Isaac-BarcodePress-FFW-SG2-Abs-v0"
+if is_barcode_ffw_task; then
+    [[ -d "${CUSTOM_TASKS}/teleop_barcode_press" ]] || {
+        echo "[isaac-lab] ! custom task package 없음: ${CUSTOM_TASKS}/teleop_barcode_press"
+        exit 1
+    }
+    if [[ -f "${CUSTOM_ASSETS}/scene/reference.usd" && -f "${CUSTOM_ASSETS}/robot/ai_worker/FFW_SG2.usd" ]]; then
+        echo "[isaac-lab] ✓ custom task: Isaac-BarcodePress-FFW-SG2-Abs-v0 (scene/reference.usd)"
     else
-        echo "[isaac-lab] ! custom_assets 미비 — FFW_SG2 / server_rack_teleop.usd 확인"
+        echo "[isaac-lab] ! custom_assets 미비 — scene/reference.usd / FFW_SG2.usd 확인"
+        exit 1
     fi
 fi
 
@@ -198,6 +196,29 @@ if [[ "$RUN_MODE" == "record" ]]; then
     if is_barcode_ffw_task; then
         RECORD_ARGS+=(--enable_cameras)
         echo "[isaac-lab]   FFW 양손 cam: --enable_cameras (obs/left_hand_cam, obs/right_hand_cam → HDF5)"
+
+        # record_demos imports built-in tasks only; register the mounted custom task after app startup.
+        RECORD_DEMOS_PY="/workspace/isaaclab/scripts/tools/record_demos.py"
+        if grep -qF "import teleop_barcode_press" "$RECORD_DEMOS_PY"; then
+            :
+        elif grep -qF "import isaaclab_tasks  # noqa: F401" "$RECORD_DEMOS_PY"; then
+            sed -i '/^import isaaclab_tasks  # noqa: F401$/a import teleop_barcode_press  # noqa: F401 - custom Gym task registration' "$RECORD_DEMOS_PY"
+            echo "[isaac-lab] ✓ record custom task registration: teleop_barcode_press"
+        else
+            echo "[isaac-lab] ! record_demos.py custom task 등록 위치를 찾지 못함" >&2
+            exit 1
+        fi
+
+        # The factory is already loaded at this point; add the custom retargeter without early imports.
+        if grep -qF "RETARGETER_MAP[FfwSg2RetargeterCfg] = FfwSg2Retargeter" "$RECORD_DEMOS_PY"; then
+            :
+        elif grep -qF "import teleop_barcode_press" "$RECORD_DEMOS_PY"; then
+            sed -i '/^import teleop_barcode_press /a from teleop_barcode_press.retargeters import FfwSg2Retargeter, FfwSg2RetargeterCfg\nimport isaaclab.devices.teleop_device_factory as teleop_device_factory\nteleop_device_factory.RETARGETER_MAP[FfwSg2RetargeterCfg] = FfwSg2Retargeter' "$RECORD_DEMOS_PY"
+            echo "[isaac-lab] ✓ record retargeter registration: FfwSg2Retargeter"
+        else
+            echo "[isaac-lab] ! record_demos.py custom retargeter 등록 위치를 찾지 못함" >&2
+            exit 1
+        fi
     fi
 
     exec ./isaaclab.sh -p scripts/tools/record_demos.py "${RECORD_ARGS[@]}"

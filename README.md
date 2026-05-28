@@ -248,6 +248,13 @@ docker compose up -d webxr-client
 docker compose exec isaac-lab bash
 docker compose exec isaac-teleop bash
 
+# Scene editor만 실행 (CloudXR/teleop 없이 Isaac Sim GUI, custom_assets 저장 가능)
+./scripts/run_scene_editor.sh
+
+# custom_assets의 기존 USD를 열고 직접 저장
+./scripts/run_scene_editor.sh \
+  --open custom_assets/env/server_rack_v6.1/server_rack_teleop.usd
+
 # 포트 리스닝 확인
 ss -tulnp | grep -E '(48322|49100|47998|8453)'
 

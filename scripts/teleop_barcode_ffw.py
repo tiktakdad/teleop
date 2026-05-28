@@ -56,8 +56,52 @@ from teleop_barcode_press.mdp.barcode_cam import (
     get_barcode_cam_in_frame,
 )
 from teleop_barcode_press.retargeters import FfwSg2Retargeter
+from teleop_barcode_press.utils import HotReloadProxy
 from teleop_barcode_press.utils.hand_cam_frustum_vis import HandCamFrustumVisualizer
 from teleop_barcode_press.utils.xr_task_hud import BarcodeXrHud
+
+FFW_EE_LINKS = ["arm_l_link7", "arm_r_link7"]
+FFW_HAND_JOINTS = [f"gripper_{side}_joint{i}" for side in ("l", "r") for i in range(1, 5)]
+
+
+def set_barcode_target_color(env, in_frame: bool) -> None:
+    """바코드 타겟 구의 색상을 실시간으로 업데이트합니다 (인식 시 초록색, 미인식 시 회색)."""
+    try:
+        from pxr import Usd, Gf
+        import omni.usd
+
+        stage = omni.usd.get_context().get_stage()
+        color = Gf.Vec3f(0.1, 0.9, 0.2) if in_frame else Gf.Vec3f(0.45, 0.45, 0.5)
+        opacity = 0.85 if in_frame else 0.15
+
+        for i in range(env.num_envs):
+            prim_path = f"/World/envs/env_{i}/BarcodeTarget"
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid():
+                continue
+
+            for p in Usd.PrimRange(prim):
+                if p.HasAttribute("inputs:diffuseColor"):
+                    p.GetAttribute("inputs:diffuseColor").Set(color)
+                if p.HasAttribute("inputs:opacity"):
+                    p.GetAttribute("inputs:opacity").Set(opacity)
+    except Exception:
+        pass
+
+
+def current_robot_action(env) -> torch.Tensor:
+    """Build a Pink target action that holds the robot at its current authored pose."""
+    robot = env.scene["robot"]
+    body_ids, _ = robot.find_bodies(FFW_EE_LINKS, preserve_order=True)
+    hand_ids, _ = robot.find_joints(FFW_HAND_JOINTS, preserve_order=True)
+    if len(body_ids) != 2 or len(hand_ids) != len(FFW_HAND_JOINTS):
+        raise RuntimeError("Unable to resolve FFW end effectors or gripper joints for pose hold.")
+
+    env_origin = env.scene.env_origins[0]
+    left_pose = torch.cat((robot.data.body_pos_w[0, body_ids[0]] - env_origin, robot.data.body_quat_w[0, body_ids[0]]))
+    right_pose = torch.cat((robot.data.body_pos_w[0, body_ids[1]] - env_origin, robot.data.body_quat_w[0, body_ids[1]]))
+    hand_pos = robot.data.joint_pos[0, hand_ids]
+    return torch.cat((left_pose, right_pose, hand_pos))
 
 
 def main() -> None:
@@ -77,8 +121,9 @@ def main() -> None:
         return
 
     should_reset = False
-    # 🔹 XR 도 Connect 직후 step 이 돌아야 카메라/frustum/인식이 갱신됨 (START 대기 시 정지 문제)
-    teleoperation_active = "handtracking" not in args_cli.teleop_device.lower()
+    is_handtracking = "handtracking" in args_cli.teleop_device.lower()
+    # XR keeps stepping for camera/HUD updates, but robot targets remain authored until START.
+    teleoperation_active = not is_handtracking
     env.teleoperation_active = teleoperation_active
     _debug_barcode = os.environ.get("BARCODE_DEBUG", "1").lower() not in ("0", "false", "no")
     _debug_interval = max(1, int(float(os.environ.get("BARCODE_DEBUG_INTERVAL", "60"))))
@@ -89,16 +134,19 @@ def main() -> None:
         should_reset = True
         print("Reset triggered - Environment will reset on next step")
 
+    hold_action = None
+
     def start_teleoperation() -> None:
         nonlocal teleoperation_active
         teleoperation_active = True
         env.teleoperation_active = True
-        print("Teleoperation activated")
+        print("Teleoperation activated - following raw hand tracking targets")
 
     def stop_teleoperation() -> None:
-        nonlocal teleoperation_active
+        nonlocal teleoperation_active, hold_action
         teleoperation_active = False
         env.teleoperation_active = False
+        hold_action = current_robot_action(env)
         print("Teleoperation deactivated")
 
     teleoperation_callbacks: dict[str, Callable[[], None]] = {
@@ -123,7 +171,12 @@ def main() -> None:
             teleop_interface.add_callback(key, callback)
     elif "handtracking" in args_cli.teleop_device.lower():
         hand_cfg = env_cfg.teleop_devices.devices["handtracking"]
-        ffw_retargeter = FfwSg2Retargeter(hand_cfg.retargeters[0])
+        # 🔹 실시간 코드 반영을 위한 HotReloadProxy 적용 (ffw_sg2_retargeter.py 수정 시 자동 리로드)
+        ffw_retargeter = HotReloadProxy(
+            module_name="teleop_barcode_press.retargeters.ffw_sg2_retargeter",
+            class_name="FfwSg2Retargeter",
+            cfg=hand_cfg.retargeters[0]
+        )
         teleop_interface = OpenXRDevice(cfg=hand_cfg, retargeters=[ffw_retargeter])
         for key, callback in teleoperation_callbacks.items():
             teleop_interface.add_callback(key, callback)
@@ -140,6 +193,8 @@ def main() -> None:
 
     env.reset()
     teleop_interface.reset()
+    hold_action = current_robot_action(env)
+    set_barcode_target_color(env, False)
     frustum_vis = HandCamFrustumVisualizer(
         env,
         camera_name="right_hand_cam",
@@ -148,22 +203,22 @@ def main() -> None:
         max_depth=HAND_CAM_FRUSTUM_MAX_DEPTH,
     )
     xr_hud = BarcodeXrHud(BARCODE_CAM_HOLD_TIME, device=env.device) if args_cli.xr else None
-    idle_action = env_cfg.idle_action.to(env.device)
     print(
         f"Teleoperation started. 바코드 {BARCODE_CAM_HOLD_TIME:.1f}s 연속 인식 시 성공. "
-        "파란 frustum=오른손 D405 시야. Press 'R' to reset, STOP=일시정지."
+        "파란 frustum=오른손 D405 시야. START=현재 손 위치에서 조작 시작, Press 'R' to reset, STOP=일시정지."
     )
 
     while simulation_app.is_running():
         try:
             with torch.inference_mode():
-                action = teleop_interface.advance()
+                raw_action = teleop_interface.advance()
 
                 if success_flash_steps > 0:
                     success_flash_steps -= 1
 
-                # 🔹 teleoperation_active 와 무관하게 항상 advance() 가 반환한 유효한 action 을 사용 (zeros 대입 시 OSQP LDL 에러 방지)
-                actions = action.unsqueeze(0) if action.dim() == 1 else action
+                selected_action = raw_action if teleoperation_active else hold_action
+
+                actions = selected_action.unsqueeze(0) if selected_action.dim() == 1 else selected_action
                 if actions.shape[0] != env.num_envs:
                     actions = actions.repeat(env.num_envs, 1)
 
@@ -179,6 +234,9 @@ def main() -> None:
                 )
                 hold_s = float(get_barcode_cam_hold_time(env)[0].item())
                 in_frame_b = bool(in_frame[0].item())
+
+                # 🔹 바코드 타겟 구의 색상 업데이트
+                set_barcode_target_color(env, in_frame_b)
 
                 frustum_vis.update(tracking_active=in_frame_b and teleoperation_active)
                 if xr_hud is not None:
@@ -200,6 +258,19 @@ def main() -> None:
                             f"fov={bool(dbg['fov_in'][0].item())} pixel={bool(dbg['pixel_in'][0].item())} "
                             f"cone={bool(dbg['cone_in'][0].item())}"
                         )
+                        
+                        # 🔹 [비교 디버그 로그] 실시간 손 추적 좌표 vs 로봇 손 카메라(레이저 가이드) 좌표 비교 출력
+                        comp_msg = ""
+                        if "ffw_retargeter" in locals() and hasattr(ffw_retargeter, "latest_right_wrist"):
+                            comp_msg += f"\n  👉 [VR Hand Target] L_Wrist: {list(ffw_retargeter.latest_left_wrist)}, R_Wrist: {list(ffw_retargeter.latest_right_wrist)}"
+                        if "frustum_vis" in locals() and hasattr(frustum_vis, "latest_cam_pos"):
+                            cam_pos_xyz = [round(x, 3) for x in frustum_vis.latest_cam_pos.tolist()]
+                            forward_xyz = [round(x, 3) for x in frustum_vis.latest_forward_w.tolist()]
+                            comp_msg += f"\n  👉 [Robot Hand Cam] Position: {cam_pos_xyz}, Direction: {forward_xyz}"
+                        
+                        if comp_msg:
+                            msg += comp_msg
+                            
                         print(msg, flush=True)
                         omni.log.info(msg)
 
@@ -231,10 +302,18 @@ def main() -> None:
                             success_flash=True,
                         )
                     env.reset()
+                    hold_action = current_robot_action(env)
+                    teleoperation_active = False if is_handtracking else teleoperation_active
+                    env.teleoperation_active = teleoperation_active
+                    set_barcode_target_color(env, False)
                     last_countdown_sec = -1
 
                 if should_reset:
                     env.reset()
+                    hold_action = current_robot_action(env)
+                    teleoperation_active = False if is_handtracking else teleoperation_active
+                    env.teleoperation_active = teleoperation_active
+                    set_barcode_target_color(env, False)
                     should_reset = False
                     last_countdown_sec = -1
                     print("Environment reset complete")

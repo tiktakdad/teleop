@@ -7,7 +7,6 @@ Replicator/hand_rgb 캡처에는 나타나지 않습니다.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,10 +20,8 @@ if TYPE_CHECKING:
 
 
 def _teleop_show_hand_cam_frustum() -> bool:
-    """record 모드 또는 명시적 비활성화 시 frustum 숨김."""
-    if os.environ.get("RUN_MODE", "teleop") == "record":
-        return False
-    return os.environ.get("HAND_CAM_FRUSTUM_VIS", "1").lower() not in ("0", "false", "no")
+    # 실시간 디버깅 및 사용자 레이저 가이드를 위해 항상 활성화합니다.
+    return True
 
 
 def _frustum_corners_cam(
@@ -114,6 +111,7 @@ class HandCamFrustumVisualizer:
         self._min_depth = min_depth
         self._max_depth = max_depth
         self._enabled = _teleop_show_hand_cam_frustum()
+        print(f"🔥 [HandCamFrustumVisualizer] 초기화됨. Enabled = {self._enabled}", flush=True)
         self._markers: VisualizationMarkers | None = None
 
         if not self._enabled:
@@ -127,14 +125,14 @@ class HandCamFrustumVisualizer:
                 prim_path="/Visuals/hand_cam_frustum",
                 markers={
                     "edge": sim_utils.CuboidCfg(
-                        size=(0.004, 0.004, 0.1),
+                        size=(0.015, 0.015, 0.1),
                         visual_material=sim_utils.PreviewSurfaceCfg(
                             diffuse_color=edge_color,
                             opacity=opacity,
                         ),
                     ),
                     "edge_track": sim_utils.CuboidCfg(
-                        size=(0.004, 0.004, 0.1),
+                        size=(0.015, 0.015, 0.1),
                         visual_material=sim_utils.PreviewSurfaceCfg(
                             diffuse_color=track_color,
                             opacity=min(1.0, opacity + 0.15),
@@ -145,6 +143,20 @@ class HandCamFrustumVisualizer:
                         visual_material=sim_utils.PreviewSurfaceCfg(
                             diffuse_color=face_color,
                             opacity=opacity * 0.55,
+                        ),
+                    ),
+                    "laser": sim_utils.CuboidCfg(
+                        size=(0.015, 0.015, 1.0),
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=edge_color,
+                            opacity=0.8,
+                        ),
+                    ),
+                    "laser_track": sim_utils.CuboidCfg(
+                        size=(0.015, 0.015, 1.0),
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=track_color,
+                            opacity=0.9,
                         ),
                     ),
                 },
@@ -158,6 +170,7 @@ class HandCamFrustumVisualizer:
             scales=torch.tensor([[0.001, 0.001, 0.001]], device=dev),
             marker_indices=[0],
         )
+        self._pose_source = "sensor"
         self._markers.set_visibility(False)
 
     def set_enabled(self, enabled: bool) -> None:
@@ -165,22 +178,34 @@ class HandCamFrustumVisualizer:
         if self._markers is not None:
             self._markers.set_visibility(self._enabled)
 
-    def update(self, tracking_active: bool = False) -> None:
-        if not self._enabled or self._markers is None:
-            return
-
-        camera = self._env.scene[self._camera_name]
-        # 🔹 render-only 구간에서도 pose 갱신 (XR START 전에도 손따라감)
+    def _resolve_camera_pose(self, camera) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the pose reported by the authored USD camera sensor."""
         try:
             camera.update(self._env.step_dt, force_recompute=True)
         except Exception:
             pass
 
-        cam_pos = camera.data.pos_w[0] - self._env.scene.env_origins[0]
+        cam_pos = camera.data.pos_w[0]
         cam_quat = camera.data.quat_w_ros[0]
+        return cam_pos, cam_quat
+
+    def update(self, tracking_active: bool = False) -> None:
+        if not self._enabled or self._markers is None:
+            return
+
+        camera = self._env.scene[self._camera_name]
+        device = self._env.device
+        cam_pos, cam_quat = self._resolve_camera_pose(camera)
+
         K = camera.data.intrinsic_matrices[0]
         height, width = camera.data.image_shape
-        device = cam_pos.device
+
+        # 🔹 외부 디버그 출력용 데이터 보관
+        self.latest_cam_pos = cam_pos.clone()
+
+        if not hasattr(self, "_step_i"):
+            self._step_i = 0
+        self._step_i += 1
 
         if not torch.isfinite(cam_pos).all() or not torch.isfinite(K).all():
             self._markers.set_visibility(False)
@@ -191,8 +216,9 @@ class HandCamFrustumVisualizer:
         near = _frustum_corners_cam(fx, fy, cx, cy, width, height, self._min_depth, self._margin_frac, device)
         far = _frustum_corners_cam(fx, fy, cx, cy, width, height, self._max_depth, self._margin_frac, device)
 
-        near_w = quat_apply(cam_quat, near) + cam_pos
-        far_w = quat_apply(cam_quat, far) + cam_pos
+        cam_quat_b = cam_quat.unsqueeze(0).expand(near.shape[0], -1)
+        near_w = quat_apply(cam_quat_b, near) + cam_pos
+        far_w = quat_apply(cam_quat_b, far) + cam_pos
         origin_w = cam_pos
 
         edge_t, edge_q, edge_s = _edge_poses(origin_w, near_w, far_w)
@@ -216,9 +242,42 @@ class HandCamFrustumVisualizer:
         translations = torch.cat([edge_t, torch.stack(face_t)], dim=0)
         orientations = torch.cat([edge_q, torch.stack(face_q)], dim=0)
         scales = torch.cat([edge_s, torch.stack(face_s)], dim=0)
+
+        # 🔹 레이저 포인터: 카메라 원점(cam_pos)에서 ROS +Z(전방)로 1.5m
+        forward_w = quat_apply(
+            cam_quat.unsqueeze(0),
+            torch.tensor([[0.0, 0.0, 1.0]], device=device),
+        ).squeeze(0)
+        self.latest_forward_w = forward_w.clone()
+
+        if self._step_i % 60 == 0:
+            print(
+                f"🔥 [HandCamFrustumVisualizer] update - source={self._pose_source}, "
+                f"Tracking Active: {tracking_active}, cam_pos: {cam_pos.tolist()}, "
+                f"forward: {forward_w.tolist()}",
+                flush=True,
+            )
+
+        laser_len = 1.5
+        laser_start = cam_pos
+        laser_end = cam_pos + forward_w * laser_len
+        laser_mid = 0.5 * (laser_start + laser_end)
+        laser_q = _quat_from_direction(forward_w)
+        laser_s = torch.tensor([1.0, 1.0, laser_len], device=device)
+
+        translations = torch.cat([translations, laser_mid.unsqueeze(0)], dim=0)
+        orientations = torch.cat([orientations, laser_q.unsqueeze(0)], dim=0)
+        scales = torch.cat([scales, laser_s.unsqueeze(0)], dim=0)
+
         n_edge = edge_t.shape[0]
         edge_idx = 1 if tracking_active else 0  # 0=edge, 1=edge_track, 2=face
-        indices = [edge_idx] * n_edge + [2] * (translations.shape[0] - n_edge)
+        indices = [edge_idx] * n_edge + [2] * (translations.shape[0] - 1 - n_edge)
+        laser_idx = 4 if tracking_active else 3
+        indices.append(laser_idx)
+
+        # 🔹 디버그용: 실제 시각화 전달 데이터 주기적 출력
+        if self._step_i % 60 == 0:
+            print(f"🔥 [HandCamFrustumVisualizer] visualize - translations (first 3 & last 1): {translations[:3].tolist()} ... {translations[-1:].tolist()}, indices (first 3 & last 1): {indices[:3]} ... {indices[-1:]}", flush=True)
 
         self._markers.visualize(
             translations=translations,

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import math
+from functools import lru_cache
 import os
 import tempfile
 
@@ -31,14 +31,13 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdF
 from isaaclab.utils import configclass
 
 from . import mdp
-from .ffw_sg2_cfg import FFW_SG2_CFG
+from .ffw_sg2_cfg import FFW_SG2_CFG, FFW_SG2_USD
 from .retargeters.ffw_sg2_retargeter import FfwSg2RetargeterCfg
 
 CUSTOM_ASSETS_DIR = os.environ.get("CUSTOM_ASSETS_DIR", "/workspace/user/custom_assets")
-SERVER_RACK_USD = os.path.join(CUSTOM_ASSETS_DIR, "env/server_rack_v6.1/server_rack_teleop.usd")
-SERVER_RACK_SOURCE_USD = os.path.join(
-    CUSTOM_ASSETS_DIR, "env/server_rack_v6.1/Server_Rack/server_rack_v5/configuration/server_rack_v5_base.usd"
-)
+REFERENCE_SCENE_USD = os.path.join(CUSTOM_ASSETS_DIR, "scene/reference.usd")
+REFERENCE_ROBOT_PRIM_PATH = "/World/FFW_SG2"
+XR_FORWARD_YAW_OFFSET_DEG = -90.0
 
 FFW_LEFT_EE_LINK = "ffw_sg2_follower_arm_l_link7"
 FFW_RIGHT_EE_LINK = "ffw_sg2_follower_arm_r_link7"
@@ -57,23 +56,35 @@ FFW_FIXED_JOINTS = [
     "head_joint2",
 ]
 
-# 🔹 기본 배치: 로봇 원점, 서버랙 +X (0.85m). Z lift 는 server_rack_teleop.usd 에 baked.
-_BASE_RACK_POS = (0.85, 0.0, 0.0)
-_BASE_RACK_ROT = (0.0, 0.0, 0.0, 1.0)  # Z 180° — 정면이 로봇 쪽
-_BASE_ROBOT_ROT = (1.0, 0.0, 0.0, 0.0)
-_BASE_BARCODE_POS = (0.50, 0.18, 1.18)
+# Fallback for old/broken reference scenes. Normal operation reads this from reference.usd.
+_FALLBACK_REFERENCE_ROBOT_POS = (1.4304832140901735, 0.0, 0.0)
+_FALLBACK_REFERENCE_ROBOT_ROT = (0.0, 0.0, 0.0, 1.0)
+BARCODE_TARGET_POS = (0.3516863028144265, 0.1996206657250342, 1.7259674316986728)
 
-# 🔹 AR Start 시 정면(+Y)에 서버랙이 보이도록 씬 전체 Z 회전 (기본 +90°)
-SCENE_YAW_DEG = float(os.environ.get("SCENE_YAW_DEG", "90"))
+HAND_CAM_WIDTH = int(os.environ.get("HAND_CAM_WIDTH", "256"))
+HAND_CAM_HEIGHT = int(os.environ.get("HAND_CAM_HEIGHT", "160"))
+HAND_CAM_FOCAL = float(os.environ.get("HAND_CAM_FOCAL_LENGTH", "5.5"))
+
+# 🔹 성공 조건: camera(오른손 cam 시야) | press(손가락 접촉, 레거시)
+BARCODE_SUCCESS_MODE = os.environ.get("BARCODE_SUCCESS_MODE", "camera").strip().lower()
+BARCODE_CAM_MARGIN = float(os.environ.get("BARCODE_CAM_MARGIN", "0.08"))
+BARCODE_CAM_MIN_DEPTH = float(os.environ.get("BARCODE_CAM_MIN_DEPTH", "0.08"))
+BARCODE_CAM_MAX_DEPTH = float(os.environ.get("BARCODE_CAM_MAX_DEPTH", "0.25"))
+BARCODE_PRESS_DISTANCE = float(os.environ.get("BARCODE_PRESS_DISTANCE", "0.045"))
+BARCODE_CAM_HOLD_TIME = float(os.environ.get("BARCODE_CAM_HOLD_TIME", "2.0"))
+HAND_CAM_FRUSTUM_MAX_DEPTH = float(os.environ.get("HAND_CAM_FRUSTUM_MAX_DEPTH", "0.25"))
 
 
 def _yaw_quat_wxyz(yaw_deg: float) -> tuple[float, float, float, float]:
+    import math
+
     half = math.radians(yaw_deg) * 0.5
     return (math.cos(half), 0.0, 0.0, math.sin(half))
 
 
 def _quat_mul(
-    q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]
+    q1: tuple[float, float, float, float],
+    q2: tuple[float, float, float, float],
 ) -> tuple[float, float, float, float]:
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
@@ -85,44 +96,91 @@ def _quat_mul(
     )
 
 
-def _rotate_xy_yaw(pos: tuple[float, float, float], yaw_deg: float) -> tuple[float, float, float]:
-    x, y, z = pos
-    rad = math.radians(yaw_deg)
-    c, s = math.cos(rad), math.sin(rad)
-    return (c * x - s * y, s * x + c * y, z)
+def _find_prim_by_name(stage, prim_name: str):
+    for prim in stage.Traverse():
+        if prim.GetName() == prim_name:
+            return prim
+    return None
 
 
-_SCENE_YAW_QUAT = _yaw_quat_wxyz(SCENE_YAW_DEG)
-SERVER_RACK_POS = _rotate_xy_yaw(_BASE_RACK_POS, SCENE_YAW_DEG)
-SERVER_RACK_ROT = _quat_mul(_SCENE_YAW_QUAT, _BASE_RACK_ROT)
-ROBOT_SPAWN_ROT = _quat_mul(_SCENE_YAW_QUAT, _BASE_ROBOT_ROT)
-BARCODE_TARGET_POS = _rotate_xy_yaw(_BASE_BARCODE_POS, SCENE_YAW_DEG)
+@lru_cache(maxsize=8)
+def _read_reference_prim_pose(
+    usd_path: str,
+    prim_path: str,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Read a prim's authored world pose from a USD file as Isaac Lab pos and wxyz quat."""
+    from pxr import Usd, UsdGeom
 
-HAND_CAM_WIDTH = int(os.environ.get("HAND_CAM_WIDTH", os.environ.get("ROBOT_CAM_WIDTH", "256")))
-HAND_CAM_HEIGHT = int(os.environ.get("HAND_CAM_HEIGHT", os.environ.get("ROBOT_CAM_HEIGHT", "160")))
-HAND_CAM_FOCAL = float(os.environ.get("HAND_CAM_FOCAL_LENGTH", os.environ.get("ROBOT_CAM_FOCAL_LENGTH", "5.5")))
+    stage = Usd.Stage.Open(usd_path)
+    if stage is None:
+        raise RuntimeError(f"Unable to open reference USD: {usd_path}")
 
-# 🔹 성공 조건: camera(오른손 cam 시야) | press(손가락 접촉, 레거시)
-BARCODE_SUCCESS_MODE = os.environ.get("BARCODE_SUCCESS_MODE", "camera").strip().lower()
-BARCODE_CAM_MARGIN = float(os.environ.get("BARCODE_CAM_MARGIN", "0.15"))
-BARCODE_CAM_MIN_DEPTH = float(os.environ.get("BARCODE_CAM_MIN_DEPTH", "0.08"))
-BARCODE_CAM_MAX_DEPTH = float(os.environ.get("BARCODE_CAM_MAX_DEPTH", "0.25"))
-BARCODE_PRESS_DISTANCE = float(os.environ.get("BARCODE_PRESS_DISTANCE", "0.045"))
-BARCODE_CAM_HOLD_TIME = float(os.environ.get("BARCODE_CAM_HOLD_TIME", "2.0"))
-HAND_CAM_FRUSTUM_MAX_DEPTH = float(os.environ.get("HAND_CAM_FRUSTUM_MAX_DEPTH", "0.25"))
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        prim = _find_prim_by_name(stage, prim_path.rsplit("/", 1)[-1])
+    if prim is None or not prim.IsValid():
+        raise RuntimeError(f"Unable to find robot prim '{prim_path}' in {usd_path}")
+
+    xformable = UsdGeom.Xformable(prim)
+    transform = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    translation = transform.ExtractTranslation()
+    rotation = transform.ExtractRotationQuat()
+    rotation_imag = rotation.GetImaginary()
+
+    pos = tuple(float(translation[i]) for i in range(3))
+    rot = (
+        float(rotation.GetReal()),
+        float(rotation_imag[0]),
+        float(rotation_imag[1]),
+        float(rotation_imag[2]),
+    )
+    return pos, rot
+
+
+def _reference_robot_pose() -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    try:
+        pos, rot = _read_reference_prim_pose(REFERENCE_SCENE_USD, REFERENCE_ROBOT_PRIM_PATH)
+        carb.log_info(
+            f"Using robot pose from {REFERENCE_SCENE_USD}:{REFERENCE_ROBOT_PRIM_PATH} "
+            f"pos={pos}, rot={rot}"
+        )
+        return pos, rot
+    except Exception as exc:
+        carb.log_warn(
+            f"Falling back to hard-coded robot pose because reference pose extraction failed: {exc}"
+        )
+        return _FALLBACK_REFERENCE_ROBOT_POS, _FALLBACK_REFERENCE_ROBOT_ROT
+
+
+REFERENCE_ROBOT_POS, REFERENCE_ROBOT_ROT = _reference_robot_pose()
+XR_ANCHOR_ROT = _quat_mul(REFERENCE_ROBOT_ROT, _yaw_quat_wxyz(XR_FORWARD_YAW_OFFSET_DEG))
+carb.log_info(
+    f"Using XR anchor pose pos={REFERENCE_ROBOT_POS}, rot={XR_ANCHOR_ROT} "
+    f"(robot_rot={REFERENCE_ROBOT_ROT}, yaw_offset_deg={XR_FORWARD_YAW_OFFSET_DEG})"
+)
+
+
+def spawn_reference_scene_for_robot(
+    prim_path: str,
+    cfg: UsdFileCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+):
+    """Spawn the authored scene before the articulation resolves its nested prim."""
+    scene_prim_path = prim_path.removesuffix("/FFW_SG2")
+    return sim_utils.spawn_from_usd(
+        scene_prim_path,
+        cfg,
+        translation=(0.0, 0.0, 0.0),
+        orientation=(1.0, 0.0, 0.0, 0.0),
+        **kwargs,
+    )
 
 
 @configclass
 class BarcodePressSceneCfg(InteractiveSceneCfg):
-    """빈 환경 + 서버랙 + FFW_SG2."""
-
-    server_rack = AssetBaseCfg(
-        prim_path="/World/envs/env_.*/ServerRack",
-        init_state=AssetBaseCfg.InitialStateCfg(pos=list(SERVER_RACK_POS), rot=list(SERVER_RACK_ROT)),
-        spawn=UsdFileCfg(
-            usd_path=SERVER_RACK_USD,
-        ),
-    )
+    """Authored server-rack and robot scene with teleoperation entities attached."""
 
     barcode_target = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/BarcodeTarget",
@@ -136,27 +194,36 @@ class BarcodePressSceneCfg(InteractiveSceneCfg):
     )
 
     robot: ArticulationCfg = FFW_SG2_CFG.replace(
-        prim_path="/World/envs/env_.*/Robot",
-        init_state=FFW_SG2_CFG.init_state.replace(rot=ROBOT_SPAWN_ROT),
+        prim_path="{ENV_REGEX_NS}/ReferenceScene/FFW_SG2",
+        spawn=FFW_SG2_CFG.spawn.replace(
+            usd_path=REFERENCE_SCENE_USD,
+            func=spawn_reference_scene_for_robot,
+        ),
+        init_state=FFW_SG2_CFG.init_state.replace(pos=REFERENCE_ROBOT_POS, rot=REFERENCE_ROBOT_ROT),
     )
 
-    # 🔹 FFW_SG2 양손 D405 — USD camera_*_link 아래 hand_rgb 에 센서 spawn
+    # The USD authors each D405 camera_link as a physical frame with +X forward.
+    # Create only the render sensor at that origin and preserve the camera_link forward axis.
     left_hand_cam = CameraCfg(
-        prim_path="/World/envs/env_.*/Robot/ffw_sg2_follower/arm_l_link7/camera_l_bottom_screw_frame/camera_l_link/hand_rgb",
+        prim_path="{ENV_REGEX_NS}/ReferenceScene/FFW_SG2/ffw_sg2_follower/arm_l_link7/camera_l_bottom_screw_frame/camera_l_link/hand_rgb",
         update_period=0.0,
         height=HAND_CAM_HEIGHT,
         width=HAND_CAM_WIDTH,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(focal_length=HAND_CAM_FOCAL, clipping_range=(0.05, 10.0)),
+        offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        update_latest_camera_pose=True,
         debug_vis=False,
     )
     right_hand_cam = CameraCfg(
-        prim_path="/World/envs/env_.*/Robot/ffw_sg2_follower/arm_r_link7/camera_r_bottom_screw_frame/camera_r_link/hand_rgb",
+        prim_path="{ENV_REGEX_NS}/ReferenceScene/FFW_SG2/ffw_sg2_follower/arm_r_link7/camera_r_bottom_screw_frame/camera_r_link/hand_rgb",
         update_period=0.0,
         height=HAND_CAM_HEIGHT,
         width=HAND_CAM_WIDTH,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(focal_length=HAND_CAM_FOCAL, clipping_range=(0.05, 10.0)),
+        offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        update_latest_camera_pose=True,
         debug_vis=False,
     )
 
@@ -225,6 +292,25 @@ class ActionsCfg:
     )
 
 
+def safe_image(env, sensor_cfg, data_type="rgb", normalize=False):
+    """헤드리스/XR 구동 조건에 따라 비어 있을 수 있는 카메라 RGB 버퍼를 안전하게 0-패딩 텐서로 대체해 시뮬레이터 크래시를 방지합니다."""
+    try:
+        val = base_mdp.image(env, sensor_cfg, data_type=data_type, normalize=normalize)
+        if val is not None and val.numel() > 0:
+            return val
+    except Exception:
+        pass
+    sensor = env.scene[sensor_cfg.name]
+    h, w = sensor.data.image_shape
+    c = 3 if data_type == "rgb" else 1
+    device = env.device
+    # ObservationManager가 단일 env일 때 (H, W, C) 형태를 기대하는 케이스가 있어
+    # env 개수에 따라 배치 차원을 조건부로 맞춥니다.
+    if getattr(env, "num_envs", 1) == 1:
+        return torch.zeros((h, w, c), dtype=torch.float32, device=device)
+    return torch.zeros((env.num_envs, h, w, c), dtype=torch.float32, device=device)
+
+
 @configclass
 class ObservationsCfg:
     @configclass
@@ -232,11 +318,11 @@ class ObservationsCfg:
         actions = ObsTerm(func=mdp.last_action)
         robot_joint_pos = ObsTerm(func=base_mdp.joint_pos, params={"asset_cfg": SceneEntityCfg("robot")})
         left_hand_cam = ObsTerm(
-            func=base_mdp.image,
+            func=safe_image,
             params={"sensor_cfg": SceneEntityCfg("left_hand_cam"), "data_type": "rgb", "normalize": False},
         )
         right_hand_cam = ObsTerm(
-            func=base_mdp.image,
+            func=safe_image,
             params={"sensor_cfg": SceneEntityCfg("right_hand_cam"), "data_type": "rgb", "normalize": False},
         )
 
@@ -298,8 +384,8 @@ class BarcodePressFFWSG2EnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
 
     xr: XrCfg = XrCfg(
-        anchor_pos=(0.0, 0.0, 0.0),
-        anchor_rot=(1.0, 0.0, 0.0, 0.0),
+        anchor_pos=REFERENCE_ROBOT_POS,
+        anchor_rot=XR_ANCHOR_ROT,
     )
 
     NUM_OPENXR_HAND_JOINTS = 26
@@ -313,7 +399,7 @@ class BarcodePressFFWSG2EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = 2
 
         temp_urdf_output_path, temp_urdf_meshes_output_path = ControllerUtils.convert_usd_to_urdf(
-            self.scene.robot.spawn.usd_path, self.temp_urdf_dir, force_conversion=True
+            FFW_SG2_USD, self.temp_urdf_dir, force_conversion=True
         )
         # URDF joint 이름은 Isaac Lab과 1:1 유지 (change_revolute_to_fixed 사용 시 Pink 매핑 깨짐)
         # 바퀴/헤드/리프트 잠금은 ffw_sg2_cfg.py actuator stiffness 로 처리

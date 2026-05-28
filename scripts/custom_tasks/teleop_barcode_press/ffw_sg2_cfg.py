@@ -10,7 +10,7 @@ from isaaclab.assets import ArticulationCfg
 CUSTOM_ASSETS_DIR = os.environ.get("CUSTOM_ASSETS_DIR", "/workspace/user/custom_assets")
 FFW_SG2_USD = os.path.join(CUSTOM_ASSETS_DIR, "robot/ai_worker/FFW_SG2.usd")
 
-# 🔹 양팔을 서버랙 방향(+X)으로 약간 뻗은 초기 자세
+# Match the authored articulation pose in scene/reference.usd.
 _DEFAULT_JOINT_POS = {
     **{f"arm_l_joint{i}": 0.0 for i in range(1, 8)},
     **{f"arm_r_joint{i}": 0.0 for i in range(1, 8)},
@@ -25,14 +25,6 @@ _DEFAULT_JOINT_POS = {
     "right_wheel_steer": 0.0,
     "rear_wheel_drive": 0.0,
     "rear_wheel_steer": 0.0,
-    # 오른팔: 서버랙 쪽으로 뻗기
-    "arm_r_joint2": -0.35,
-    "arm_r_joint4": -1.2,
-    "arm_r_joint6": 0.8,
-    # 왼팔: 몸 옆 대기
-    "arm_l_joint2": 0.35,
-    "arm_l_joint4": -1.2,
-    "arm_l_joint6": 0.8,
 }
 
 FFW_SG2_CFG = ArticulationCfg(

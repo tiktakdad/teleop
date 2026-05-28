@@ -18,9 +18,8 @@ from isaaclab.utils.math import quat_apply
 
 
 def _xr_hud_enabled() -> bool:
-    if os.environ.get("RUN_MODE", "teleop") == "record":
-        return False
-    return os.environ.get("BARCODE_XR_HUD", "1").lower() not in ("0", "false", "no")
+    # 사용자 요청에 따라 HMD 추적 빨간구/회색구 HUD 시각화를 완전히 비활성화합니다.
+    return False
 
 
 def _get_head_pose_world() -> tuple[np.ndarray, np.ndarray] | None:
