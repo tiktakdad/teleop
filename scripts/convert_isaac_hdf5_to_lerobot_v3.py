@@ -27,7 +27,6 @@ import pyarrow.parquet as pq
 
 CODEBASE_VERSION = "v3.0"
 DEFAULT_FPS = 50
-VIDEO_KEY = "observation.images.robot_pov"
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
 
@@ -35,6 +34,34 @@ DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
 EPISODES_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 TASKS_PATH = "meta/tasks.parquet"
+
+
+def _discover_cameras(grp) -> list[tuple[str, str]]:
+    """obs/ 그룹에서 카메라 이미지 데이터셋을 탐지.
+
+    반환: (hdf5_obs_key, lerobot_video_key) 리스트.
+    이미지 = ndim==4, 마지막 축==3, uint8 인 데이터셋.
+    예) head_cam -> observation.images.head
+        robot_pov_cam -> observation.images.robot_pov
+    """
+    cams: list[tuple[str, str]] = []
+    obs = grp["obs"]
+    for key in sorted(obs.keys()):
+        item = obs[key]
+        if (
+            isinstance(item, h5py.Dataset)
+            and item.ndim == 4
+            and item.shape[-1] == 3
+            and item.dtype == np.uint8
+        ):
+            name = key[:-4] if key.endswith("_cam") else key
+            cams.append((f"obs/{key}", f"observation.images.{name}"))
+    if not cams:
+        raise RuntimeError(
+            "HDF5 obs/ 그룹에서 카메라 이미지 데이터셋을 찾지 못했습니다 "
+            "(ndim==4, 마지막 축==3, uint8)."
+        )
+    return cams
 
 
 def _try_lerobot_convert(
@@ -46,7 +73,7 @@ def _try_lerobot_convert(
     robot_type: str,
 ) -> bool:
     try:
-        from lerobot.datasets import LeRobotDataset
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ImportError:
         return False
 
@@ -60,7 +87,15 @@ def _try_lerobot_convert(
         sample = f[f"data/{demo_keys[0]}"]
         state_dim = sample["obs/robot_joint_pos"].shape[1]
         action_dim = sample["processed_actions"].shape[1]
-        h, w = sample["obs/robot_pov_cam"].shape[1:3]
+        cameras = _discover_cameras(sample)
+        cam_shapes = {
+            video_key: sample[obs_key].shape[1:3] for obs_key, video_key in cameras
+        }
+
+    print(
+        "[convert] 카메라: "
+        + ", ".join(f"{o}→{v}" for o, v in cameras)
+    )
 
     features = {
         STATE_KEY: {
@@ -73,14 +108,16 @@ def _try_lerobot_convert(
             "shape": (action_dim,),
             "names": [f"action_{i}" for i in range(action_dim)],
         },
-        VIDEO_KEY: {
+    }
+    for _obs_key, video_key in cameras:
+        h, w = cam_shapes[video_key]
+        features[video_key] = {
             "dtype": "video",
             "shape": (3, h, w),
             "names": ["channels", "height", "width"],
-        },
-    }
+        }
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         root=output_dir,
@@ -95,14 +132,17 @@ def _try_lerobot_convert(
             grp = f[f"data/{demo_key}"]
             states = grp["obs/robot_joint_pos"][:]
             actions = grp["processed_actions"][:]
-            images = grp["obs/robot_pov_cam"][:]
+            cam_arrays = {
+                video_key: grp[obs_key][:] for obs_key, video_key in cameras
+            }
             for t in range(len(states)):
                 frame = {
                     STATE_KEY: states[t].astype(np.float32),
                     ACTION_KEY: actions[t].astype(np.float32),
-                    VIDEO_KEY: np.transpose(images[t], (2, 0, 1)),
                     "task": task,
                 }
+                for video_key in cam_arrays:
+                    frame[video_key] = np.transpose(cam_arrays[video_key][t], (2, 0, 1))
                 dataset.add_frame(frame)
             dataset.save_episode()
 
@@ -182,8 +222,9 @@ def _probe_video(path: Path) -> dict:
 
 
 def _concat_mp4(paths: list[Path], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     if len(paths) == 1:
-        shutil.move(paths[0], out_path)
+        shutil.move(str(paths[0]), str(out_path))
         return
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         list_path = Path(f.name)
@@ -251,6 +292,10 @@ def _standalone_convert(
             [k for k in f["data"].keys() if k.startswith("demo_")],
             key=lambda x: int(x.split("_")[1]),
         )
+        cameras = _discover_cameras(f[f"data/{demo_keys[0]}"])
+
+    video_keys = [vk for _ok, vk in cameras]
+    print("[convert] 카메라: " + ", ".join(f"{o}→{v}" for o, v in cameras))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     meta_dir = output_dir / "meta"
@@ -273,7 +318,9 @@ def _standalone_convert(
     global_stats: dict | None = None
     global_index = 0
     video_ts = 0.0
-    temp_videos: list[Path] = []
+    # 카메라별 임시 mp4 목록 / 누적 타임스탬프
+    temp_videos: dict[str, list[Path]] = {vk: [] for vk in video_keys}
+    cam_hw: dict[str, tuple[int, int]] = {}
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -282,12 +329,16 @@ def _standalone_convert(
                 grp = f[f"data/{demo_key}"]
                 states = grp["obs/robot_joint_pos"][:].astype(np.float32)
                 actions = grp["processed_actions"][:].astype(np.float32)
-                images = grp["obs/robot_pov_cam"][:]
+                cam_arrays = {vk: grp[ok][:] for ok, vk in cameras}
 
             ep_len = len(states)
-            ep_mp4 = tmp_path / f"ep_{ep_idx:04d}.mp4"
-            ep_dur = _encode_episode_mp4(images, fps, ep_mp4)
-            temp_videos.append(ep_mp4)
+            ep_dur = 0.0
+            for vk in video_keys:
+                imgs = cam_arrays[vk]
+                cam_hw[vk] = (imgs.shape[1], imgs.shape[2])
+                ep_mp4 = tmp_path / f"{vk.replace('.', '_')}_ep_{ep_idx:04d}.mp4"
+                ep_dur = _encode_episode_mp4(imgs, fps, ep_mp4)
+                temp_videos[vk].append(ep_mp4)
 
             ep_stats = {
                 STATE_KEY: _compute_feature_stats(states),
@@ -315,11 +366,12 @@ def _standalone_convert(
                 "data/file_index": 0,
                 "meta/episodes/chunk_index": 0,
                 "meta/episodes/file_index": 0,
-                f"videos/{VIDEO_KEY}/chunk_index": 0,
-                f"videos/{VIDEO_KEY}/file_index": 0,
-                f"videos/{VIDEO_KEY}/from_timestamp": video_ts,
-                f"videos/{VIDEO_KEY}/to_timestamp": video_ts + ep_dur,
             }
+            for vk in video_keys:
+                ep_meta[f"videos/{vk}/chunk_index"] = 0
+                ep_meta[f"videos/{vk}/file_index"] = 0
+                ep_meta[f"videos/{vk}/from_timestamp"] = video_ts
+                ep_meta[f"videos/{vk}/to_timestamp"] = video_ts + ep_dur
             ep_meta.update(_flatten_stats("stats", ep_stats))
             episode_rows.append(ep_meta)
             video_ts += ep_dur
@@ -361,16 +413,19 @@ def _standalone_convert(
         ep_path.parent.mkdir(parents=True, exist_ok=True)
         ep_df.to_parquet(ep_path)
 
-        # videos
-        video_out = output_dir / VIDEO_PATH.format(
-            video_key=VIDEO_KEY, chunk_index=0, file_index=0
-        )
-        _concat_mp4(temp_videos, video_out)
-        video_info = _probe_video(video_out)
+        # videos (카메라별)
+        video_info: dict[str, dict] = {}
+        video_outs: dict[str, Path] = {}
+        for vk in video_keys:
+            video_out = output_dir / VIDEO_PATH.format(
+                video_key=vk, chunk_index=0, file_index=0
+            )
+            _concat_mp4(temp_videos[vk], video_out)
+            video_info[vk] = _probe_video(video_out)
+            video_outs[vk] = video_out
 
     state_dim = states_cat.shape[1]
     action_dim = actions_cat.shape[1]
-    h, w = images.shape[1], images.shape[2]
 
     features = {
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
@@ -388,13 +443,15 @@ def _standalone_convert(
             "shape": [action_dim],
             "names": [f"action_{i}" for i in range(action_dim)],
         },
-        VIDEO_KEY: {
+    }
+    for vk in video_keys:
+        h, w = cam_hw[vk]
+        features[vk] = {
             "dtype": "video",
             "shape": [3, h, w],
             "names": ["channels", "height", "width"],
-            "info": video_info,
-        },
-    }
+            "info": video_info[vk],
+        }
 
     info = {
         "codebase_version": CODEBASE_VERSION,
@@ -419,7 +476,9 @@ def _standalone_convert(
 
     print(f"[convert] 완료: {output_dir}")
     print(f"  episodes: {len(demo_keys)}, frames: {global_index}")
-    print(f"  video: {video_out} ({video_out.stat().st_size / 1e6:.1f} MB)")
+    for vk in video_keys:
+        vo = video_outs[vk]
+        print(f"  video[{vk}]: {vo} ({vo.stat().st_size / 1e6:.1f} MB)")
 
 
 def main() -> int:

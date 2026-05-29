@@ -44,6 +44,11 @@ class CameraPreviewDisplays:
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="teleop_camera_previews_"))
         # 중앙(head_cam) 디스플레이 월드 정보 (컨트롤 패널 배치용)
         self.center_display_info: dict | None = None
+        # 오른손 프리뷰 하단 네비게이션/카운트 패널
+        self._nav_enabled = os.environ.get("TELEOP_NAV_PANEL", "1").lower() not in ("0", "false", "no")
+        self._nav_texture_input = None
+        self._nav_px = (384, 256)
+        self._right_display_geom: dict | None = None
 
         if not self._enabled:
             return
@@ -132,6 +137,51 @@ class CameraPreviewDisplays:
                     "width": float(display_width),
                     "height": float(display_height),
                 }
+            if camera_name == "right_hand_cam":
+                self._right_display_geom = {
+                    "center": np.array(display_center, dtype=np.float32),
+                    "right": np.array(right, dtype=np.float32),
+                    "up": np.array(up, dtype=np.float32),
+                    "width": float(display_width),
+                    "height": float(display_height),
+                }
+
+        if self._nav_enabled and self._right_display_geom is not None:
+            self._define_nav_panel(gap)
+
+    def _define_nav_panel(self, gap: float) -> None:
+        """오른손 프리뷰 디스플레이 바로 아래에 네비게이션/카운트 패널 생성."""
+        geom = self._right_display_geom
+        right = geom["right"]
+        up = geom["up"]
+        panel_width = geom["width"]
+        panel_height = float(os.environ.get("TELEOP_NAV_PANEL_HEIGHT", "0.34"))
+        # 오른손 디스플레이 하단 모서리에서 gap 만큼 아래로 내려 패널 중심 배치
+        panel_center = geom["center"] - (0.5 * geom["height"] + gap + 0.5 * panel_height) * up
+        points = [
+            panel_center - 0.5 * panel_width * right - 0.5 * panel_height * up,
+            panel_center + 0.5 * panel_width * right - 0.5 * panel_height * up,
+            panel_center + 0.5 * panel_width * right + 0.5 * panel_height * up,
+            panel_center - 0.5 * panel_width * right + 0.5 * panel_height * up,
+        ]
+        mesh = UsdGeom.Mesh.Define(self._stage, "/World/CameraPreviewDisplays/nav_panel")
+        mesh.CreatePointsAttr([Gf.Vec3f(*p.tolist()) for p in points])
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        mesh.CreateDoubleSidedAttr(True)
+        st = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+            "st",
+            Sdf.ValueTypeNames.TexCoord2fArray,
+            UsdGeom.Tokens.varying,
+        )
+        st.Set([Gf.Vec2f(0.0, 1.0), Gf.Vec2f(1.0, 1.0), Gf.Vec2f(1.0, 0.0), Gf.Vec2f(0.0, 0.0)])
+        self._bind_camera_material(mesh, "nav_panel")
+        self._nav_texture_input = self._texture_inputs.get("nav_panel")
+        # 패널 픽셀 크기를 가로세로 비율에 맞춤
+        aspect = panel_width / max(panel_height, 1e-6)
+        h = 256
+        w = int(round(h * aspect))
+        self._nav_px = (max(64, w), h)
 
     def _cabinet_bounds(self) -> tuple[np.ndarray, float] | None:
         candidates = ("cavinet_v2", "cabinet_v2", "cabinet_link/visuals", "cabinet_link")
@@ -247,3 +297,111 @@ class CameraPreviewDisplays:
             texture_input = self._texture_inputs.get(camera_name)
             if texture_input is not None:
                 texture_input.Set(Sdf.AssetPath(str(path)))
+
+    def _nav_font(self, size: int):
+        try:
+            from PIL import ImageFont
+
+            for fp in (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ):
+                if os.path.exists(fp):
+                    return ImageFont.truetype(fp, size)
+            return ImageFont.load_default()
+        except Exception:
+            return None
+
+    def update_nav_panel(
+        self,
+        *,
+        offset_cam: np.ndarray | None,
+        distance_m: float,
+        hold_s: float,
+        hold_time_s: float,
+        in_frame: bool,
+        success: bool,
+    ) -> None:
+        """오른손 프리뷰 하단 패널에 목표(노란 구)까지의 방향/거리 + 카운트 표시."""
+        if not self._enabled or not self._nav_enabled or self._nav_texture_input is None:
+            return
+        # update() 와 동일한 _step_i 카운터를 공유하므로 별도 증가 없이 같은 주기에만 갱신
+        if self._step_i % self._period != 0:
+            return
+
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            return
+
+        w, h = self._nav_px
+        img = Image.new("RGB", (w, h), (16, 18, 22))
+        draw = ImageDraw.Draw(img)
+
+        if success:
+            accent = (40, 220, 110)
+        elif in_frame:
+            accent = (255, 150, 15)
+        else:
+            accent = (235, 210, 60)
+
+        # ── 상단: 목표 방향 화살표 ───────────────────────────────────
+        cx, cy = w * 0.5, h * 0.32
+        arrow_r = h * 0.22
+        # 디스플레이(회전+반전 적용) 화면 기준: 패널 오른쪽 = 카메라 y(아래), 패널 아래 = 카메라 x(오른쪽)
+        dirx, diry = 0.0, 0.0
+        if offset_cam is not None:
+            ax = float(offset_cam[0])  # 카메라 right
+            ay = float(offset_cam[1])  # 카메라 down
+            dirx, diry = ay, ax
+            norm = (dirx * dirx + diry * diry) ** 0.5
+            if norm > 1e-4:
+                dirx, diry = dirx / norm, diry / norm
+            else:
+                dirx, diry = 0.0, 0.0
+        if dirx == 0.0 and diry == 0.0:
+            # 중앙 정렬됨 → 채워진 원
+            draw.ellipse(
+                [cx - arrow_r * 0.5, cy - arrow_r * 0.5, cx + arrow_r * 0.5, cy + arrow_r * 0.5],
+                fill=accent,
+            )
+        else:
+            tip = (cx + dirx * arrow_r, cy + diry * arrow_r)
+            perp = (-diry, dirx)
+            base = (cx - dirx * arrow_r * 0.6, cy - diry * arrow_r * 0.6)
+            left = (base[0] + perp[0] * arrow_r * 0.55, base[1] + perp[1] * arrow_r * 0.55)
+            right = (base[0] - perp[0] * arrow_r * 0.55, base[1] - perp[1] * arrow_r * 0.55)
+            draw.polygon([tip, left, right], fill=accent)
+
+        # ── 거리 텍스트: 화살표 중앙에 숫자만 크게 표시 ──────────────
+        dist_cm = max(0.0, distance_m) * 100.0
+        dist_text = "OK" if (in_frame and distance_m < 0.05) else f"{dist_cm:.0f}"
+        font_big = self._nav_font(int(h * 0.30))
+        font_small = self._nav_font(int(h * 0.13))
+        if font_big is not None:
+            # 화살표 중심에 겹쳐 큰 숫자 표시 (가독성을 위해 검은 외곽선)
+            draw.text(
+                (cx, cy),
+                dist_text,
+                fill=(255, 255, 255),
+                font=font_big,
+                anchor="mm",
+                stroke_width=max(2, int(h * 0.012)),
+                stroke_fill=(0, 0, 0),
+            )
+
+        # ── 카운트(홀드 타이머) 텍스트 + 진행 바 ─────────────────────
+        count_text = f"{min(hold_s, hold_time_s):.1f} / {hold_time_s:.1f} s"
+        if font_small is not None:
+            draw.text((w * 0.5, h * 0.78), count_text, fill=(200, 205, 215), font=font_small, anchor="mm")
+        bar_x0, bar_x1 = w * 0.12, w * 0.88
+        bar_y = h * 0.93
+        bar_h = h * 0.04
+        draw.rectangle([bar_x0, bar_y, bar_x1, bar_y + bar_h], fill=(45, 48, 55))
+        frac = 0.0 if hold_time_s <= 0 else max(0.0, min(1.0, hold_s / hold_time_s))
+        if frac > 0:
+            draw.rectangle([bar_x0, bar_y, bar_x0 + (bar_x1 - bar_x0) * frac, bar_y + bar_h], fill=accent)
+
+        path = self._tmp_dir / f"nav_panel_{self._step_i:08d}.png"
+        img.save(path)
+        self._nav_texture_input.Set(Sdf.AssetPath(str(path)))

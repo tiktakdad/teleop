@@ -21,6 +21,25 @@ parser.add_argument(
     default=False,
     help="Enable Pinocchio (Pink IK).",
 )
+parser.add_argument(
+    "--record",
+    action="store_true",
+    default=False,
+    help="데이터 수집 모드: 텔레옵과 동일하게 동작하되 성공(3초 유지) 시 에피소드를 HDF5로 저장하고 reset.",
+)
+parser.add_argument(
+    "--dataset_file",
+    type=str,
+    default="/workspace/user/datasets/dataset.hdf5",
+    help="record 모드에서 데모를 저장할 HDF5 경로.",
+)
+parser.add_argument("--num_demos", type=int, default=0, help="record 모드에서 수집할 데모 수 (0=무한).")
+parser.add_argument(
+    "--num_success_steps",
+    type=int,
+    default=10,
+    help="성공 종료로 간주하기 위한 연속 성공 스텝 수.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -114,6 +133,26 @@ def set_barcode_target_color(env, state: str | bool) -> None:
         pass
 
 
+def set_barcode_target_visible(env, visible: bool) -> None:
+    """record 모드에서 노란색 구가 녹화 영상에 들어가지 않도록 BarcodeTarget prim 가시성을 토글."""
+    try:
+        import omni.usd
+        from pxr import UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        for i in range(env.num_envs):
+            prim = stage.GetPrimAtPath(f"/World/envs/env_{i}/BarcodeTarget")
+            if not prim.IsValid():
+                continue
+            imageable = UsdGeom.Imageable(prim)
+            if visible:
+                imageable.MakeVisible()
+            else:
+                imageable.MakeInvisible()
+    except Exception:
+        pass
+
+
 def current_robot_action(env) -> torch.Tensor:
     """Build a Pink target action that holds the robot at its current authored pose."""
     robot = env.scene["robot"]
@@ -197,9 +236,36 @@ def main() -> None:
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.env_name = args_cli.task
     env_cfg.terminations.time_out = None
+
+    record_mode = bool(args_cli.record)
+    success_term = None
+    if record_mode:
+        # record 모드: 텔레옵과 동일하게 동작하되 성공을 메인 루프에서 수동 판정해 에피소드를 저장한다.
+        # (record_demos.py 와 동일한 패턴) 성공 종료조건은 비활성화하고 success_term 으로 직접 확인.
+        if hasattr(env_cfg.terminations, "success"):
+            success_term = env_cfg.terminations.success
+            env_cfg.terminations.success = None
+        env_cfg.observations.policy.concatenate_terms = False
+        try:
+            from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
+            from isaaclab.managers import DatasetExportMode
+
+            output_dir = os.path.dirname(args_cli.dataset_file)
+            output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+            env_cfg.recorders = ActionStateRecorderManagerCfg()
+            env_cfg.recorders.dataset_export_dir_path = output_dir
+            env_cfg.recorders.dataset_filename = output_file_name
+            env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+            print(f"[record] dataset → {args_cli.dataset_file} (num_demos={args_cli.num_demos})", flush=True)
+        except Exception as exc:
+            omni.log.error(f"Failed to configure recorders: {exc}")
+            simulation_app.close()
+            return
     # 핸드 트래킹(텔레옥) 모드에서는 성공 시 자동 reset이 핸드 트래킹을 끊으므로 종료조건을 비활성화한다.
     # (인디케이터 초록색 전환은 메인 루프에서 수동 타이머로 유지)
-    if "handtracking" in args_cli.teleop_device.lower():
+    elif "handtracking" in args_cli.teleop_device.lower():
         env_cfg.terminations.success = None
 
     if args_cli.xr:
@@ -215,7 +281,8 @@ def main() -> None:
 
     should_reset = False
     is_handtracking = "handtracking" in args_cli.teleop_device.lower()
-    # XR keeps stepping for camera/HUD updates, but robot targets remain authored until START.
+    # record 모드에서 START로 인한 reset은 텔레옵을 활성 상태로 유지해야 한다.
+    pending_start_reset = False    # XR keeps stepping for camera/HUD updates, but robot targets remain authored until START.
     teleoperation_active = not is_handtracking
     env.teleoperation_active = teleoperation_active
     _debug_barcode = os.environ.get("BARCODE_DEBUG", "1").lower() not in ("0", "false", "no")
@@ -231,11 +298,15 @@ def main() -> None:
     lift_controller: LiftJointController | None = None
 
     def start_teleoperation() -> None:
-        nonlocal teleoperation_active
+        nonlocal teleoperation_active, should_reset, pending_start_reset
         teleoperation_active = True
         env.teleoperation_active = True
         if lift_controller is not None:
             lift_controller.reset_hand_tracking()
+        # record 모드: START 시 환경/레코더 버퍼를 리셋해 초기상태부터 깨끗하게 녹화 시작 (활성 유지)
+        if record_mode:
+            should_reset = True
+            pending_start_reset = True
         print("Teleoperation activated - following raw hand tracking targets")
 
     def stop_teleoperation() -> None:
@@ -269,6 +340,12 @@ def main() -> None:
             teleop_interface.add_callback(key, callback)
     elif "handtracking" in args_cli.teleop_device.lower():
         hand_cfg = env_cfg.teleop_devices.devices["handtracking"]
+        # 🔹 record 모드: 손 트래킹 마커(붉은 점)가 녹화 영상/데이터셋에 찍히지 않도록 시각화 비활성.
+        #    (트래킹·리타게팅은 그대로 동작)
+        if record_mode:
+            for _rt in hand_cfg.retargeters:
+                if hasattr(_rt, "enable_visualization"):
+                    _rt.enable_visualization = False
         # 🔹 실시간 코드 반영을 위한 HotReloadProxy 적용 (ffw_sg2_retargeter.py 수정 시 자동 리로드)
         ffw_retargeter = HotReloadProxy(
             module_name="teleop_barcode_press.retargeters.ffw_sg2_retargeter",
@@ -290,19 +367,27 @@ def main() -> None:
 
     last_countdown_sec = -1
     success_flash_steps = 0
+    success_step_count = 0
+    recorded_demo_count = 0
 
     env.reset()
     teleop_interface.reset()
     hold_action = current_robot_action(env)
     lift_controller = LiftJointController(env)
-    set_barcode_target_color(env, False)
-    frustum_vis = HandCamFrustumVisualizer(
-        env,
-        camera_name="right_hand_cam",
-        margin_frac=BARCODE_CAM_MARGIN,
-        min_depth=BARCODE_CAM_MIN_DEPTH,
-        max_depth=HAND_CAM_FRUSTUM_MAX_DEPTH,
-    )
+    # record 모드에서는 노란색 구·파란 레이저(시각화 인디케이터)를 제거해 녹화 영상에 들어가지 않게 한다.
+    # (상위 카메라 디스플레이/네비게이션 패널은 유지)
+    if record_mode:
+        set_barcode_target_visible(env, False)
+        frustum_vis = None
+    else:
+        set_barcode_target_color(env, False)
+        frustum_vis = HandCamFrustumVisualizer(
+            env,
+            camera_name="right_hand_cam",
+            margin_frac=BARCODE_CAM_MARGIN,
+            min_depth=BARCODE_CAM_MIN_DEPTH,
+            max_depth=HAND_CAM_FRUSTUM_MAX_DEPTH,
+        )
     xr_hud = BarcodeXrHud(BARCODE_CAM_HOLD_TIME, device=env.device) if args_cli.xr else None
     camera_previews = CameraPreviewDisplays(
         env,
@@ -371,9 +456,11 @@ def main() -> None:
                 in_frame_b = bool(in_frame[0].item())
 
                 laser_state = "success" if hold_s >= BARCODE_CAM_HOLD_TIME else "contact" if in_frame_b else "idle"
-                # 🔹 바코드 타겟 구의 색상 업데이트
-                set_barcode_target_color(env, laser_state)
-                frustum_vis.update(tracking_active=in_frame_b and teleoperation_active, laser_state=laser_state)
+                # 🔹 바코드 타겟 구의 색상 업데이트 (record 모드에서는 인디케이터를 숨기므로 생략)
+                if not record_mode:
+                    set_barcode_target_color(env, laser_state)
+                if frustum_vis is not None:
+                    frustum_vis.update(tracking_active=in_frame_b and teleoperation_active, laser_state=laser_state)
                 if xr_hud is not None:
                     xr_hud.update(
                         teleop_active=teleoperation_active,
@@ -382,6 +469,23 @@ def main() -> None:
                         success_flash=success_flash_steps > 0,
                     )
                 camera_previews.update()
+
+                # 🔹 오른손 프리뷰 하단: 목표(노란 구)까지 방향/거리 + 카운트 표시
+                _dbg_nav = get_barcode_cam_debug(env)
+                if _dbg_nav is not None and "p_cam" in _dbg_nav:
+                    _offset_cam = _dbg_nav["p_cam"][0].detach().cpu().numpy()
+                    _dist_m = float(_dbg_nav["dist"][0].item())
+                else:
+                    _offset_cam = None
+                    _dist_m = 0.0
+                camera_previews.update_nav_panel(
+                    offset_cam=_offset_cam,
+                    distance_m=_dist_m,
+                    hold_s=hold_s,
+                    hold_time_s=BARCODE_CAM_HOLD_TIME,
+                    in_frame=in_frame_b,
+                    success=(laser_state == "success"),
+                )
 
                 _step_i += 1
                 if _debug_barcode and _step_i % _debug_interval == 0:
@@ -423,6 +527,34 @@ def main() -> None:
                 elif not in_frame_b:
                     last_countdown_sec = -1
 
+                # 🔹 record 모드: 3초 연속 유지(성공) 시 에피소드 저장 후 reset → 다음 에피소드 녹화
+                if record_mode and teleoperation_active:
+                    if hold_s >= BARCODE_CAM_HOLD_TIME:
+                        success_step_count += 1
+                        if success_step_count >= args_cli.num_success_steps and not should_reset:
+                            env.recorder_manager.record_pre_reset([0], force_export_or_skip=False)
+                            env.recorder_manager.set_success_to_episodes(
+                                [0],
+                                torch.tensor([[True]], dtype=torch.bool, device=env.device),
+                            )
+                            env.recorder_manager.export_episodes([0])
+                            success_flash_steps = 30
+                            should_reset = True
+                            print(
+                                f"[record] ✓ 바코드 {BARCODE_CAM_HOLD_TIME:.1f}s 유지 — 에피소드 저장",
+                                flush=True,
+                            )
+                    else:
+                        success_step_count = 0
+
+                    exported = int(env.recorder_manager.exported_successful_episode_count)
+                    if exported > recorded_demo_count:
+                        recorded_demo_count = exported
+                        print(f"[record] 저장된 데모: {recorded_demo_count}", flush=True)
+                    if args_cli.num_demos > 0 and exported >= args_cli.num_demos:
+                        print(f"[record] 목표 {args_cli.num_demos}개 수집 완료 — 종료", flush=True)
+                        break
+
                 if (
                     teleoperation_active
                     and terminated is not None
@@ -450,13 +582,27 @@ def main() -> None:
                     last_countdown_sec = -1
 
                 if should_reset:
+                    if record_mode:
+                        # 비-성공(수동 R/START) 시 진행 중 에피소드 버퍼를 버리고 새로 시작
+                        env.recorder_manager.reset()
+                        success_step_count = 0
                     env.reset()
+                    if record_mode:
+                        # reset 후에도 노란색 구가 녹화에 들어가지 않도록 다시 숨김
+                        set_barcode_target_visible(env, False)
                     hold_action = current_robot_action(env)
                     if lift_controller is not None:
                         lift_controller.refresh_from_robot()
-                    teleoperation_active = False if is_handtracking else teleoperation_active
+                    if record_mode:
+                        # record 모드: reset 후에도 텔레옵 핸드포인트를 계속 따라가도록 활성 유지
+                        # (성공/START 어느 경로든 다음 에피소드를 바로 녹화)
+                        teleoperation_active = True
+                    else:
+                        teleoperation_active = False if is_handtracking else teleoperation_active
                     env.teleoperation_active = teleoperation_active
-                    set_barcode_target_color(env, False)
+                    pending_start_reset = False
+                    if not record_mode:
+                        set_barcode_target_color(env, False)
                     should_reset = False
                     last_countdown_sec = -1
                     print("Environment reset complete")

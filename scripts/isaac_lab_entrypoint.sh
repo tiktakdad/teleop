@@ -184,6 +184,25 @@ if [[ "$RUN_MODE" == "record" ]]; then
     fi
     echo "[isaac-lab]   저장 경로: $DATASET_FILE"
 
+    # 🔹 바코드 FFW 태스크: record_demos.py 대신 텔레옵 스크립트(--record)로 수집해
+    #    텔레옵과 동일하게 동작(카메라 프리뷰/네비/3초 성공) + 시각화 인디케이터는 녹화에서 제거.
+    if is_barcode_ffw_task; then
+        echo "[isaac-lab] 🔴 데이터 수집 — FFW 바코드 (teleop_barcode_ffw.py --record, hand cam ON)"
+        BARCODE_RECORD_ARGS=("${COMMON_ARGS[@]}"
+            --enable_cameras
+            --record
+            --dataset_file "$DATASET_FILE"
+            --num_demos "${NUM_DEMOS:-10}"
+        )
+        if [[ -n "${NUM_SUCCESS_STEPS:-}" ]]; then
+            BARCODE_RECORD_ARGS+=(--num_success_steps "$NUM_SUCCESS_STEPS")
+        fi
+        if [[ "${TELEOP_DEVICE:-handtracking}" == *handtracking* ]]; then
+            BARCODE_RECORD_ARGS+=(--xr)
+        fi
+        exec ./isaaclab.sh -p /workspace/user/scripts/teleop_barcode_ffw.py "${BARCODE_RECORD_ARGS[@]}"
+    fi
+
     if [[ -n "${RECORD_FPS:-}" ]]; then
         RECORD_DEMOS_PY="/workspace/isaaclab/scripts/tools/record_demos.py"
         if grep -qF "# [teleop] RECORD_FPS env-step patch" "$RECORD_DEMOS_PY"; then

@@ -67,13 +67,15 @@ def _compute_view_metrics(
         "valid": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
         "pixel_in": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
         "cone_in": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+        "fov_in": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
         "depth": torch.zeros(env.num_envs, device=env.device),
         "ray_hit": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
         "ray_dist": torch.zeros(env.num_envs, device=env.device),
         "u": torch.zeros(env.num_envs, device=env.device),
         "v": torch.zeros(env.num_envs, device=env.device),
+        "dist": torch.zeros(env.num_envs, device=env.device),
+        "p_cam": torch.zeros(env.num_envs, 3, device=env.device),
     }
-
     cam_pos, cam_quat = _resolve_camera_pose(env, camera_cfg.name, camera)
     intrinsics = camera.data.intrinsic_matrices
     if cam_pos is None or cam_quat is None or intrinsics is None:
@@ -136,6 +138,7 @@ def _compute_view_metrics(
         "u": u,
         "v": v,
         "dist": dist,
+        "p_cam": p_cam,
     }
 
 

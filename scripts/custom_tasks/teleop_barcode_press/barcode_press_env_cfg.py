@@ -59,14 +59,18 @@ FFW_FIXED_JOINTS = [
 # Fallback for old/broken reference scenes. Normal operation reads this from reference.usd.
 _FALLBACK_REFERENCE_ROBOT_POS = (1.4304832140901735, 0.0, 0.0)
 _FALLBACK_REFERENCE_ROBOT_ROT = (0.0, 0.0, 0.0, 1.0)
-# device_barcode 태그 Plane(/World/server_rack_v6_1/srv_00_link/Plane) 월드 중심에 맞춤
-BARCODE_TARGET_POS = (0.3516863028144265, 0.1996206657250342, 1.1423)
+# reference.usd 안에서 노란색 바코드 태그(prim 이름에 "barcode" 포함) Mesh 를 자동 탐지하지 못할 때 사용하는 폴백 좌표.
+_FALLBACK_BARCODE_TARGET_POS = (0.3542, 0.1996, 1.5855)
+# 이름에 아래 키워드가 들어간 prim 을 바코드 태그로 간주 (서버랙 모델이 바뀌어도 자동 추적)
+_BARCODE_PRIM_KEYWORDS = ("barcodeplane", "barcode", "device_barc")
 
 HAND_CAM_WIDTH = int(os.environ.get("HAND_CAM_WIDTH", "256"))
 HAND_CAM_HEIGHT = int(os.environ.get("HAND_CAM_HEIGHT", "160"))
 HAND_CAM_FOCAL = float(os.environ.get("HAND_CAM_FOCAL_LENGTH", "5.5"))
-HEAD_CAM_WIDTH = int(os.environ.get("HEAD_CAM_WIDTH", str(HAND_CAM_WIDTH)))
-HEAD_CAM_HEIGHT = int(os.environ.get("HEAD_CAM_HEIGHT", str(HAND_CAM_HEIGHT)))
+# 헤드(POV) 카메라는 데이터셋 영상용 고해상도(1280x720) 기본값을 사용.
+# HEAD_CAM_WIDTH/HEIGHT > ROBOT_CAM_WIDTH/HEIGHT(.env 호환) > 1280x720 순으로 결정.
+HEAD_CAM_WIDTH = int(os.environ.get("HEAD_CAM_WIDTH", os.environ.get("ROBOT_CAM_WIDTH", "1280")))
+HEAD_CAM_HEIGHT = int(os.environ.get("HEAD_CAM_HEIGHT", os.environ.get("ROBOT_CAM_HEIGHT", "720")))
 HEAD_CAM_FOCAL = float(os.environ.get("HEAD_CAM_FOCAL_LENGTH", "6.0"))
 
 # 🔹 성공 조건: camera(오른손 cam 시야) | press(손가락 접촉, 레거시)
@@ -157,7 +161,70 @@ def _reference_robot_pose() -> tuple[tuple[float, float, float], tuple[float, fl
         return _FALLBACK_REFERENCE_ROBOT_POS, _FALLBACK_REFERENCE_ROBOT_ROT
 
 
+def _find_barcode_prim(stage):
+    """이름에 바코드 키워드가 들어간 렌더 가능한 Mesh prim 을 탐색."""
+    from pxr import UsdGeom
+
+    fallback = None
+    for prim in stage.Traverse():
+        name = prim.GetName().lower()
+        if not any(key in name for key in _BARCODE_PRIM_KEYWORDS):
+            continue
+        if prim.IsA(UsdGeom.Mesh):
+            return prim
+        if fallback is None and UsdGeom.Imageable(prim):
+            fallback = prim
+    return fallback
+
+
+def _read_barcode_world_center(usd_path: str) -> tuple[float, float, float]:
+    """reference.usd 에서 바코드 태그 Mesh 를 찾아 월드 중심 좌표를 계산."""
+    from pxr import Gf, Usd, UsdGeom
+
+    stage = Usd.Stage.Open(usd_path)
+    if stage is None:
+        raise RuntimeError(f"Unable to open reference USD: {usd_path}")
+
+    prim = _find_barcode_prim(stage)
+    if prim is None or not prim.IsValid():
+        raise RuntimeError(f"No barcode prim found in {usd_path}")
+
+    xform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    mesh = UsdGeom.Mesh(prim)
+    points = mesh.GetPointsAttr().Get() if mesh else None
+    if points:
+        world_pts = [xform.Transform(Gf.Vec3d(p[0], p[1], p[2])) for p in points]
+        cx = sum(w[0] for w in world_pts) / len(world_pts)
+        cy = sum(w[1] for w in world_pts) / len(world_pts)
+        cz = sum(w[2] for w in world_pts) / len(world_pts)
+    else:
+        t = xform.ExtractTranslation()
+        cx, cy, cz = float(t[0]), float(t[1]), float(t[2])
+    return (float(cx), float(cy), float(cz))
+
+
+def _barcode_target_pos() -> tuple[float, float, float]:
+    override = os.environ.get("BARCODE_TARGET_POS", "").strip()
+    if override:
+        try:
+            parts = tuple(float(v) for v in override.replace(",", " ").split())
+            if len(parts) == 3:
+                carb.log_info(f"Using BARCODE_TARGET_POS override={parts}")
+                return parts
+        except ValueError:
+            carb.log_warn(f"Invalid BARCODE_TARGET_POS override={override!r}; auto-detecting instead")
+    try:
+        pos = _read_barcode_world_center(REFERENCE_SCENE_USD)
+        carb.log_info(f"Auto-detected barcode target pos={pos} from {REFERENCE_SCENE_USD}")
+        return pos
+    except Exception as exc:
+        carb.log_warn(f"Barcode auto-detection failed ({exc}); using fallback {_FALLBACK_BARCODE_TARGET_POS}")
+        return _FALLBACK_BARCODE_TARGET_POS
+
+
 REFERENCE_ROBOT_POS, REFERENCE_ROBOT_ROT = _reference_robot_pose()
+# 서버랙 모델 변경에 대응: reference.usd 에서 노란 바코드 태그 위치를 자동 탐지해 구를 배치
+BARCODE_TARGET_POS = _barcode_target_pos()
 XR_ANCHOR_ROT = _quat_mul(REFERENCE_ROBOT_ROT, _yaw_quat_wxyz(XR_FORWARD_YAW_OFFSET_DEG))
 carb.log_info(
     f"Using XR anchor pose pos={REFERENCE_ROBOT_POS}, rot={XR_ANCHOR_ROT} "
