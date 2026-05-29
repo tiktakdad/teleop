@@ -59,20 +59,25 @@ FFW_FIXED_JOINTS = [
 # Fallback for old/broken reference scenes. Normal operation reads this from reference.usd.
 _FALLBACK_REFERENCE_ROBOT_POS = (1.4304832140901735, 0.0, 0.0)
 _FALLBACK_REFERENCE_ROBOT_ROT = (0.0, 0.0, 0.0, 1.0)
-BARCODE_TARGET_POS = (0.3516863028144265, 0.1996206657250342, 1.7259674316986728)
+# device_barcode 태그 Plane(/World/server_rack_v6_1/srv_00_link/Plane) 월드 중심에 맞춤
+BARCODE_TARGET_POS = (0.3516863028144265, 0.1996206657250342, 1.1423)
 
 HAND_CAM_WIDTH = int(os.environ.get("HAND_CAM_WIDTH", "256"))
 HAND_CAM_HEIGHT = int(os.environ.get("HAND_CAM_HEIGHT", "160"))
 HAND_CAM_FOCAL = float(os.environ.get("HAND_CAM_FOCAL_LENGTH", "5.5"))
+HEAD_CAM_WIDTH = int(os.environ.get("HEAD_CAM_WIDTH", str(HAND_CAM_WIDTH)))
+HEAD_CAM_HEIGHT = int(os.environ.get("HEAD_CAM_HEIGHT", str(HAND_CAM_HEIGHT)))
+HEAD_CAM_FOCAL = float(os.environ.get("HEAD_CAM_FOCAL_LENGTH", "6.0"))
 
 # 🔹 성공 조건: camera(오른손 cam 시야) | press(손가락 접촉, 레거시)
 BARCODE_SUCCESS_MODE = os.environ.get("BARCODE_SUCCESS_MODE", "camera").strip().lower()
 BARCODE_CAM_MARGIN = float(os.environ.get("BARCODE_CAM_MARGIN", "0.08"))
 BARCODE_CAM_MIN_DEPTH = float(os.environ.get("BARCODE_CAM_MIN_DEPTH", "0.08"))
-BARCODE_CAM_MAX_DEPTH = float(os.environ.get("BARCODE_CAM_MAX_DEPTH", "0.25"))
+BARCODE_CAM_MAX_DEPTH = float(os.environ.get("BARCODE_CAM_MAX_DEPTH", "0.6"))
 BARCODE_PRESS_DISTANCE = float(os.environ.get("BARCODE_PRESS_DISTANCE", "0.045"))
-BARCODE_CAM_HOLD_TIME = float(os.environ.get("BARCODE_CAM_HOLD_TIME", "2.0"))
-HAND_CAM_FRUSTUM_MAX_DEPTH = float(os.environ.get("HAND_CAM_FRUSTUM_MAX_DEPTH", "0.25"))
+BARCODE_TARGET_RADIUS = float(os.environ.get("BARCODE_TARGET_RADIUS", "0.045"))
+BARCODE_CAM_HOLD_TIME = float(os.environ.get("BARCODE_CAM_HOLD_TIME", "3.0"))
+HAND_CAM_FRUSTUM_MAX_DEPTH = float(os.environ.get("HAND_CAM_FRUSTUM_MAX_DEPTH", "0.6"))
 
 
 def _yaw_quat_wxyz(yaw_deg: float) -> tuple[float, float, float, float]:
@@ -186,10 +191,10 @@ class BarcodePressSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/BarcodeTarget",
         init_state=RigidObjectCfg.InitialStateCfg(pos=list(BARCODE_TARGET_POS), rot=(1.0, 0.0, 0.0, 0.0)),
         spawn=sim_utils.SphereCfg(
-            radius=0.025,
+            radius=BARCODE_TARGET_RADIUS,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.2), opacity=0.15),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.82, 0.05), opacity=1.0),
         ),
     )
 
@@ -223,6 +228,17 @@ class BarcodePressSceneCfg(InteractiveSceneCfg):
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(focal_length=HAND_CAM_FOCAL, clipping_range=(0.05, 10.0)),
         offset=CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        update_latest_camera_pose=True,
+        debug_vis=False,
+    )
+    head_cam = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/ReferenceScene/FFW_SG2/ffw_sg2_follower/head_link2/head_rgb",
+        update_period=0.0,
+        height=HEAD_CAM_HEIGHT,
+        width=HEAD_CAM_WIDTH,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(focal_length=HEAD_CAM_FOCAL, clipping_range=(0.05, 12.0)),
+        offset=CameraCfg.OffsetCfg(pos=(0.08, 0.0, 0.02), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
         update_latest_camera_pose=True,
         debug_vis=False,
     )
@@ -321,6 +337,10 @@ class ObservationsCfg:
         left_hand_cam = ObsTerm(
             func=safe_image,
             params={"sensor_cfg": SceneEntityCfg("left_hand_cam"), "data_type": "rgb", "normalize": False},
+        )
+        head_cam = ObsTerm(
+            func=safe_image,
+            params={"sensor_cfg": SceneEntityCfg("head_cam"), "data_type": "rgb", "normalize": False},
         )
         right_hand_cam = ObsTerm(
             func=safe_image,

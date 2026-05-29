@@ -7,7 +7,7 @@ Replicator/hand_rgb 캡처에는 나타나지 않습니다.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -93,8 +93,31 @@ def _edge_poses(origin: torch.Tensor, corners_near: torch.Tensor, corners_far: t
     return torch.stack(translations), torch.stack(orientations), torch.stack(scales)
 
 
+LaserState = Literal["idle", "contact", "success"]
+
+
+def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
+    out = quat.clone()
+    out[..., 1:] = -out[..., 1:]
+    return out
+
+
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    w1, x1, y1, z1 = q1.unbind(dim=-1)
+    w2, x2, y2, z2 = q2.unbind(dim=-1)
+    return torch.stack(
+        (
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ),
+        dim=-1,
+    )
+
+
 class HandCamFrustumVisualizer:
-    """단일 env 기준 오른손(또는 지정) 카메라 frustum 와이어프레임."""
+    """단일 env 기준 오른손(또는 지정) 카메라 정면 레이저 인디케이터."""
 
     def __init__(
         self,
@@ -117,46 +140,32 @@ class HandCamFrustumVisualizer:
         if not self._enabled:
             return
 
-        edge_color = (0.15, 0.55, 1.0)
-        track_color = (0.1, 0.9, 0.35)
-        face_color = (0.15, 0.55, 1.0)
+        idle_color = (0.15, 0.55, 1.0)
+        contact_color = (1.0, 0.82, 0.08)
+        success_color = (0.1, 0.9, 0.35)
         self._markers = VisualizationMarkers(
             VisualizationMarkersCfg(
                 prim_path="/Visuals/hand_cam_frustum",
                 markers={
-                    "edge": sim_utils.CuboidCfg(
-                        size=(0.015, 0.015, 0.1),
+                    "laser_idle": sim_utils.CuboidCfg(
+                        size=(0.006, 0.006, 1.0),
                         visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=edge_color,
-                            opacity=opacity,
+                            diffuse_color=idle_color,
+                            opacity=1.0,
                         ),
                     ),
-                    "edge_track": sim_utils.CuboidCfg(
-                        size=(0.015, 0.015, 0.1),
+                    "laser_contact": sim_utils.CuboidCfg(
+                        size=(0.006, 0.006, 1.0),
                         visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=track_color,
-                            opacity=min(1.0, opacity + 0.15),
+                            diffuse_color=contact_color,
+                            opacity=1.0,
                         ),
                     ),
-                    "face": sim_utils.CuboidCfg(
-                        size=(0.1, 0.1, 0.002),
+                    "laser_success": sim_utils.CuboidCfg(
+                        size=(0.006, 0.006, 1.0),
                         visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=face_color,
-                            opacity=opacity * 0.55,
-                        ),
-                    ),
-                    "laser": sim_utils.CuboidCfg(
-                        size=(0.015, 0.015, 1.0),
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=edge_color,
-                            opacity=0.8,
-                        ),
-                    ),
-                    "laser_track": sim_utils.CuboidCfg(
-                        size=(0.015, 0.015, 1.0),
-                        visual_material=sim_utils.PreviewSurfaceCfg(
-                            diffuse_color=track_color,
-                            opacity=0.9,
+                            diffuse_color=success_color,
+                            opacity=1.0,
                         ),
                     ),
                 },
@@ -171,6 +180,10 @@ class HandCamFrustumVisualizer:
             marker_indices=[0],
         )
         self._pose_source = "sensor"
+        self._body_id: int | None = None
+        self._camera_pos_in_body: torch.Tensor | None = None
+        self._camera_quat_in_body: torch.Tensor | None = None
+        self._init_body_pose_source(camera_name)
         self._markers.set_visibility(False)
 
     def set_enabled(self, enabled: bool) -> None:
@@ -178,18 +191,49 @@ class HandCamFrustumVisualizer:
         if self._markers is not None:
             self._markers.set_visibility(self._enabled)
 
+    def _init_body_pose_source(self, camera_name: str) -> None:
+        side = "r" if "right" in camera_name or "_r" in camera_name else "l"
+        body_name = f"arm_{side}_link7"
+        try:
+            robot = self._env.scene["robot"]
+            body_ids, _ = robot.find_bodies([body_name], preserve_order=True)
+            if len(body_ids) != 1:
+                return
+            camera = self._env.scene[camera_name]
+            camera.update(self._env.step_dt, force_recompute=True)
+            body_id = body_ids[0]
+            body_pos = robot.data.body_pos_w[0, body_id]
+            body_quat = robot.data.body_quat_w[0, body_id]
+            cam_pos = camera.data.pos_w[0]
+            cam_quat = camera.data.quat_w_ros[0]
+            inv_body_quat = _quat_conjugate(body_quat)
+            self._body_id = body_id
+            self._camera_pos_in_body = quat_apply(inv_body_quat.unsqueeze(0), (cam_pos - body_pos).unsqueeze(0)).squeeze(0)
+            self._camera_quat_in_body = _quat_mul(inv_body_quat, cam_quat)
+            self._pose_source = body_name
+        except Exception as exc:
+            print(f"[HandCamFrustumVisualizer] using sensor pose fallback: {exc}", flush=True)
+
     def _resolve_camera_pose(self, camera) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read the pose reported by the authored USD camera sensor."""
+        """Resolve hand camera pose from the moving wrist link when the USD sensor pose is static."""
         try:
             camera.update(self._env.step_dt, force_recompute=True)
         except Exception:
             pass
 
+        if self._body_id is not None and self._camera_pos_in_body is not None and self._camera_quat_in_body is not None:
+            robot = self._env.scene["robot"]
+            body_pos = robot.data.body_pos_w[0, self._body_id]
+            body_quat = robot.data.body_quat_w[0, self._body_id]
+            cam_pos = body_pos + quat_apply(body_quat.unsqueeze(0), self._camera_pos_in_body.unsqueeze(0)).squeeze(0)
+            cam_quat = _quat_mul(body_quat, self._camera_quat_in_body)
+            return cam_pos, cam_quat
+
         cam_pos = camera.data.pos_w[0]
         cam_quat = camera.data.quat_w_ros[0]
         return cam_pos, cam_quat
 
-    def update(self, tracking_active: bool = False) -> None:
+    def update(self, tracking_active: bool = False, laser_state: LaserState | None = None) -> None:
         if not self._enabled or self._markers is None:
             return
 
@@ -198,7 +242,6 @@ class HandCamFrustumVisualizer:
         cam_pos, cam_quat = self._resolve_camera_pose(camera)
 
         K = camera.data.intrinsic_matrices[0]
-        height, width = camera.data.image_shape
 
         # 🔹 외부 디버그 출력용 데이터 보관
         self.latest_cam_pos = cam_pos.clone()
@@ -212,38 +255,7 @@ class HandCamFrustumVisualizer:
             return
 
         self._markers.set_visibility(True)
-        fx, fy, cx, cy = K[0, 0].item(), K[1, 1].item(), K[0, 2].item(), K[1, 2].item()
-        near = _frustum_corners_cam(fx, fy, cx, cy, width, height, self._min_depth, self._margin_frac, device)
-        far = _frustum_corners_cam(fx, fy, cx, cy, width, height, self._max_depth, self._margin_frac, device)
-
-        cam_quat_b = cam_quat.unsqueeze(0).expand(near.shape[0], -1)
-        near_w = quat_apply(cam_quat_b, near) + cam_pos
-        far_w = quat_apply(cam_quat_b, far) + cam_pos
-        origin_w = cam_pos
-
-        edge_t, edge_q, edge_s = _edge_poses(origin_w, near_w, far_w)
-        # 🔹 측면 4개 — 얇은 반투명 패널
-        face_t = []
-        face_q = []
-        face_s = []
-        for i in range(4):
-            p0, p1 = far_w[i], far_w[(i + 1) % 4]
-            mid = (origin_w + p0 + p1) / 3.0
-            w_edge = torch.linalg.norm(p1 - p0)
-            h_edge = torch.linalg.norm(0.5 * (p0 + p1) - origin_w)
-            normal = torch.cross(p1 - p0, origin_w - p0, dim=-1)
-            face_t.append(mid)
-            face_q.append(_quat_from_direction(normal))
-            face_s.append(torch.tensor([w_edge.item(), h_edge.item(), 0.002], device=device))
-
-        if edge_t.shape[0] == 0:
-            return
-
-        translations = torch.cat([edge_t, torch.stack(face_t)], dim=0)
-        orientations = torch.cat([edge_q, torch.stack(face_q)], dim=0)
-        scales = torch.cat([edge_s, torch.stack(face_s)], dim=0)
-
-        # 🔹 레이저 포인터: 카메라 원점(cam_pos)에서 ROS +Z(전방)로 1.5m
+        # 🔹 레이저 포인터: 카메라 원점(cam_pos)에서 ROS +Z(전방)로 0.5m
         forward_w = quat_apply(
             cam_quat.unsqueeze(0),
             torch.tensor([[0.0, 0.0, 1.0]], device=device),
@@ -258,26 +270,24 @@ class HandCamFrustumVisualizer:
                 flush=True,
             )
 
-        laser_len = 1.5
+        laser_len = float(self._max_depth)
         laser_start = cam_pos
         laser_end = cam_pos + forward_w * laser_len
         laser_mid = 0.5 * (laser_start + laser_end)
         laser_q = _quat_from_direction(forward_w)
         laser_s = torch.tensor([1.0, 1.0, laser_len], device=device)
 
-        translations = torch.cat([translations, laser_mid.unsqueeze(0)], dim=0)
-        orientations = torch.cat([orientations, laser_q.unsqueeze(0)], dim=0)
-        scales = torch.cat([scales, laser_s.unsqueeze(0)], dim=0)
-
-        n_edge = edge_t.shape[0]
-        edge_idx = 1 if tracking_active else 0  # 0=edge, 1=edge_track, 2=face
-        indices = [edge_idx] * n_edge + [2] * (translations.shape[0] - 1 - n_edge)
-        laser_idx = 4 if tracking_active else 3
-        indices.append(laser_idx)
+        translations = laser_mid.unsqueeze(0)
+        orientations = laser_q.unsqueeze(0)
+        scales = laser_s.unsqueeze(0)
+        if laser_state is None:
+            laser_state = "contact" if tracking_active else "idle"
+        laser_idx = {"idle": 0, "contact": 1, "success": 2}.get(laser_state, 0)
+        indices = [laser_idx]
 
         # 🔹 디버그용: 실제 시각화 전달 데이터 주기적 출력
         if self._step_i % 60 == 0:
-            print(f"🔥 [HandCamFrustumVisualizer] visualize - translations (first 3 & last 1): {translations[:3].tolist()} ... {translations[-1:].tolist()}, indices (first 3 & last 1): {indices[:3]} ... {indices[-1:]}", flush=True)
+            print(f"🔥 [HandCamFrustumVisualizer] visualize - laser: {translations.tolist()}, state={laser_state}, indices={indices}", flush=True)
 
         self._markers.visualize(
             translations=translations,

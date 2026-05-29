@@ -53,6 +53,19 @@ class FfwSg2Retargeter(RetargeterBase):
         self.latest_left_wrist = np.round(left_hand_poses.get("wrist", np.zeros(7, dtype=np.float32))[:3], 3)
         self.latest_right_wrist = np.round(right_hand_poses.get("wrist", np.zeros(7, dtype=np.float32))[:3], 3)
 
+        # 🔹 컨트롤 패널 상호작용용: 오른손 검지 끝 위치 + 핀치(엄지-검지) 여부
+        right_index = right_hand_poses.get("index_tip", right_hand_poses.get("index"))
+        right_thumb = right_hand_poses.get("thumb_tip", right_hand_poses.get("thumb"))
+        if right_index is not None:
+            self.latest_right_index = np.round(np.array(right_index[:3], dtype=np.float32), 4)
+        else:
+            self.latest_right_index = self.latest_right_wrist.astype(np.float32)
+        if right_index is not None and right_thumb is not None:
+            pinch_dist = float(np.linalg.norm(np.array(right_index[:3], dtype=np.float32) - np.array(right_thumb[:3], dtype=np.float32)))
+            self.latest_right_pinch = bool(pinch_dist < 0.03)
+        else:
+            self.latest_right_pinch = False
+
         # 🔹 디버그용: 입력받은 손 실시간 트래킹 데이터 값 변화 확인 (너무 빈번하지 않게 60스텝마다 출력)
         self._step_i = getattr(self, "_step_i", 0) + 1
         if left_hand_poses or right_hand_poses:
@@ -91,6 +104,10 @@ class FfwSg2Retargeter(RetargeterBase):
         left_gripper = self._compute_gripper_joint(left_hand_poses)
         right_gripper = self._compute_gripper_joint(right_hand_poses)
         hand_joints = np.array([left_gripper, right_gripper], dtype=np.float32)
+
+        # 🔹 리프트 제어용: 양손 그리퍼 컴(주먹 쑥기) 정도 보관
+        self.latest_left_gripper = float(left_gripper)
+        self.latest_right_gripper = float(right_gripper)
 
         if self._step_i % 60 == 0:
             print(

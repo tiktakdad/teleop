@@ -43,36 +43,61 @@ from isaaclab.devices import OpenXRDevice, Se3Keyboard, Se3KeyboardCfg, Se3Space
 import teleop_barcode_press  # noqa: F401 — gym 등록
 from isaaclab_tasks.utils import parse_env_cfg
 from teleop_barcode_press.barcode_press_env_cfg import (
+    BARCODE_TARGET_POS,
     BARCODE_CAM_HOLD_TIME,
     BARCODE_CAM_MARGIN,
     BARCODE_CAM_MAX_DEPTH,
     BARCODE_CAM_MIN_DEPTH,
     HAND_CAM_FRUSTUM_MAX_DEPTH,
+    REFERENCE_ROBOT_POS,
 )
 from teleop_barcode_press.mdp.barcode_cam import (
     barcode_in_frame_mask,
     get_barcode_cam_debug,
     get_barcode_cam_hold_time,
     get_barcode_cam_in_frame,
+    update_barcode_cam_hold,
 )
 from teleop_barcode_press.retargeters import FfwSg2Retargeter
 from teleop_barcode_press.utils import HotReloadProxy
+from teleop_barcode_press.utils.camera_preview_displays import CameraPreviewDisplays
 from teleop_barcode_press.utils.hand_cam_frustum_vis import HandCamFrustumVisualizer
 from teleop_barcode_press.utils.xr_task_hud import BarcodeXrHud
 
 FFW_EE_LINKS = ["arm_l_link7", "arm_r_link7"]
 FFW_HAND_JOINTS = ["gripper_l_joint1", "gripper_r_joint1"]
+FFW_LIFT_JOINT = "lift_joint"
+LIFT_MIN = float(os.environ.get("TELEOP_LIFT_MIN", "-0.5"))
+LIFT_MAX = float(os.environ.get("TELEOP_LIFT_MAX", "0.0"))
+LIFT_STEP = float(os.environ.get("TELEOP_LIFT_STEP", "0.05"))
+LIFT_HANDTRACKING = os.environ.get("TELEOP_LIFT_HANDTRACKING", "1").lower() not in ("0", "false", "no")
+LIFT_HAND_SCALE = float(os.environ.get("TELEOP_LIFT_HAND_SCALE", "1.0"))
+LIFT_TARGET_VEL = float(os.environ.get("TELEOP_LIFT_TARGET_VEL", "0.35"))
+# 리프트 모드: auto=오른손 높이 추종, manual=양손 주먹 쑥기(왼손 ↓ / 오른손 ↑). 기본 manual.
+LIFT_MODE = os.environ.get("TELEOP_LIFT_MODE", "manual").strip().lower()
+# 그리퍼 쑥힘 임계값(0~π/4.6). 이 이상이면 주먹으로 간주.
+LIFT_FIST_THRESH = float(os.environ.get("TELEOP_LIFT_FIST_THRESH", "0.45"))
+LIFT_FIST_VEL = float(os.environ.get("TELEOP_LIFT_FIST_VEL", "0.3"))
 
 
-def set_barcode_target_color(env, in_frame: bool) -> None:
+def set_barcode_target_color(env, state: str | bool) -> None:
     """바코드 타겟 구의 색상을 실시간으로 업데이트합니다 (인식 시 초록색, 미인식 시 회색)."""
     try:
         from pxr import Usd, Gf
         import omni.usd
 
         stage = omni.usd.get_context().get_stage()
-        color = Gf.Vec3f(0.1, 0.9, 0.2) if in_frame else Gf.Vec3f(0.45, 0.45, 0.5)
-        opacity = 0.85 if in_frame else 0.15
+        if isinstance(state, bool):
+            state = "contact" if state else "idle"
+        if state == "success":
+            color = Gf.Vec3f(0.1, 0.9, 0.35)
+            opacity = 1.0
+        elif state == "contact":
+            color = Gf.Vec3f(1.0, 0.58, 0.05)
+            opacity = 1.0
+        else:
+            color = Gf.Vec3f(1.0, 0.82, 0.05)
+            opacity = 1.0
 
         for i in range(env.num_envs):
             prim_path = f"/World/envs/env_{i}/BarcodeTarget"
@@ -104,10 +129,78 @@ def current_robot_action(env) -> torch.Tensor:
     return torch.cat((left_pose, right_pose, hand_pos))
 
 
+class LiftJointController:
+    def __init__(self, env):
+        self._env = env
+        self._robot = env.scene["robot"]
+        joint_ids, _ = self._robot.find_joints([FFW_LIFT_JOINT], preserve_order=True)
+        if len(joint_ids) != 1:
+            raise RuntimeError("Unable to resolve lift_joint for teleop lift control.")
+        self._joint_id = joint_ids[0]
+        self._hand_base_z: float | None = None
+        self._lift_base_target: float | None = None
+        limits_msg = ""
+        try:
+            limits = self._robot.data.soft_joint_pos_limits[0, self._joint_id]
+            limits_msg = f" limits=[{limits[0].item():.3f}, {limits[1].item():.3f}]"
+        except Exception:
+            pass
+        print(f"[teleop] resolved lift control joint '{FFW_LIFT_JOINT}' id={self._joint_id}{limits_msg}", flush=True)
+        self.refresh_from_robot()
+
+    def refresh_from_robot(self) -> None:
+        pos = self._robot.data.joint_pos[:, self._joint_id]
+        self._target = float(pos[0].item())
+        self.reset_hand_tracking()
+        self.apply()
+
+    def reset_hand_tracking(self) -> None:
+        self._hand_base_z = None
+        self._lift_base_target = None
+
+    def current_position(self) -> float:
+        return float(self._robot.data.joint_pos[0, self._joint_id].item())
+
+    def move(self, delta: float) -> None:
+        self._target = max(LIFT_MIN, min(LIFT_MAX, self._target + delta))
+        self._hand_base_z = None
+        self._lift_base_target = None
+        self.apply()
+        print(f"[teleop] lift_joint target={self._target:.3f} m", flush=True)
+
+    def nudge(self, delta: float) -> None:
+        """Continuous manual move (no log spam, resets hand-tracking baseline)."""
+        self._target = max(LIFT_MIN, min(LIFT_MAX, self._target + delta))
+        self._hand_base_z = None
+        self._lift_base_target = None
+        self.apply()
+
+    def sync_to_hand_height(self, wrist_z: float, dt: float) -> None:
+        if self._hand_base_z is None or self._lift_base_target is None:
+            self._hand_base_z = wrist_z
+            self._lift_base_target = self._target
+            return
+        desired = max(LIFT_MIN, min(LIFT_MAX, self._lift_base_target + (wrist_z - self._hand_base_z) * LIFT_HAND_SCALE))
+        max_delta = max(0.0, LIFT_TARGET_VEL * dt)
+        self._target += max(-max_delta, min(max_delta, desired - self._target))
+
+    def apply(self) -> None:
+        target = torch.full((self._env.num_envs, 1), self._target, dtype=torch.float32, device=self._env.device)
+        self._robot.set_joint_position_target(target, joint_ids=[self._joint_id])
+        try:
+            self._robot.write_data_to_sim()
+        except Exception:
+            pass
+
+
 def main() -> None:
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.env_name = args_cli.task
     env_cfg.terminations.time_out = None
+    # 핸드 트래킹(텔레옥) 모드에서는 성공 시 자동 reset이 핸드 트래킹을 끊으므로 종료조건을 비활성화한다.
+    # (인디케이터 초록색 전환은 메인 루프에서 수동 타이머로 유지)
+    if "handtracking" in args_cli.teleop_device.lower():
+        env_cfg.terminations.success = None
 
     if args_cli.xr:
         # FFW 양손 hand cam 은 유지 (debug_vis + record 연동)
@@ -135,11 +228,14 @@ def main() -> None:
         print("Reset triggered - Environment will reset on next step")
 
     hold_action = None
+    lift_controller: LiftJointController | None = None
 
     def start_teleoperation() -> None:
         nonlocal teleoperation_active
         teleoperation_active = True
         env.teleoperation_active = True
+        if lift_controller is not None:
+            lift_controller.reset_hand_tracking()
         print("Teleoperation activated - following raw hand tracking targets")
 
     def stop_teleoperation() -> None:
@@ -147,6 +243,8 @@ def main() -> None:
         teleoperation_active = False
         env.teleoperation_active = False
         hold_action = current_robot_action(env)
+        if lift_controller is not None:
+            lift_controller.reset_hand_tracking()
         print("Teleoperation deactivated")
 
     teleoperation_callbacks: dict[str, Callable[[], None]] = {
@@ -186,6 +284,8 @@ def main() -> None:
         simulation_app.close()
         return
 
+    # 리프트는 이제 키보드/메타퀄스트 컴트롤러가 아닌 씬 내 컨트롤 패널(가리키기/핀치)로 제어한다.
+
     print(f"Using teleop device: {teleop_interface}")
 
     last_countdown_sec = -1
@@ -194,6 +294,7 @@ def main() -> None:
     env.reset()
     teleop_interface.reset()
     hold_action = current_robot_action(env)
+    lift_controller = LiftJointController(env)
     set_barcode_target_color(env, False)
     frustum_vis = HandCamFrustumVisualizer(
         env,
@@ -203,15 +304,41 @@ def main() -> None:
         max_depth=HAND_CAM_FRUSTUM_MAX_DEPTH,
     )
     xr_hud = BarcodeXrHud(BARCODE_CAM_HOLD_TIME, device=env.device) if args_cli.xr else None
+    camera_previews = CameraPreviewDisplays(
+        env,
+        robot_pos=REFERENCE_ROBOT_POS,
+        target_pos=BARCODE_TARGET_POS,
+    )
     print(
         f"Teleoperation started. 바코드 {BARCODE_CAM_HOLD_TIME:.1f}s 연속 인식 시 성공. "
-        "파란 frustum=오른손 D405 시야. START=현재 손 위치에서 조작 시작, Press 'R' to reset, STOP=일시정지."
+        "파란 선=오른손 D405 정면. START=현재 손 위치에서 조작 시작. "
+        f"리프트 모드={LIFT_MODE} (manual=왼손 주먹↓/오른손 주먹↑, auto=오른손 높이 추종). "
+        "Press 'R' to reset, STOP=일시정지."
     )
 
     while simulation_app.is_running():
         try:
             with torch.inference_mode():
                 raw_action = teleop_interface.advance()
+
+                # 리프트 제어: auto=오른손 높이 추종, manual=주먹 쑥기(왼손 ↓ / 오른손 ↑)
+                if (
+                    LIFT_HANDTRACKING
+                    and teleoperation_active
+                    and is_handtracking
+                    and lift_controller is not None
+                    and "ffw_retargeter" in locals()
+                ):
+                    if LIFT_MODE == "auto" and hasattr(ffw_retargeter, "latest_right_wrist"):
+                        lift_controller.sync_to_hand_height(float(ffw_retargeter.latest_right_wrist[2]), env.step_dt)
+                    else:
+                        left_fist = float(getattr(ffw_retargeter, "latest_left_gripper", 0.0)) >= LIFT_FIST_THRESH
+                        right_fist = float(getattr(ffw_retargeter, "latest_right_gripper", 0.0)) >= LIFT_FIST_THRESH
+                        delta = LIFT_FIST_VEL * env.step_dt
+                        if right_fist and not left_fist:
+                            lift_controller.nudge(delta)
+                        elif left_fist and not right_fist:
+                            lift_controller.nudge(-delta)
 
                 if success_flash_steps > 0:
                     success_flash_steps -= 1
@@ -222,7 +349,11 @@ def main() -> None:
                 if actions.shape[0] != env.num_envs:
                     actions = actions.repeat(env.num_envs, 1)
 
+                if lift_controller is not None:
+                    lift_controller.apply()
                 step_out = env.step(actions)
+                if lift_controller is not None:
+                    lift_controller.apply()
                 terminated = step_out[2] if teleoperation_active else None
 
                 # 🔹 termination 과 동일 로직으로 매 스텝 갱신 (로그/HUD용)
@@ -232,13 +363,17 @@ def main() -> None:
                     min_depth=BARCODE_CAM_MIN_DEPTH,
                     max_depth=BARCODE_CAM_MAX_DEPTH,
                 )
+                # 성공 종료조건을 비활성화한 핸드 트래킹 모드에서는 홀드 타이머를 수동 누적
+                # (3초 유지 시 인디케이터만 초록색으로 바뀌고 env.reset()은 하지 않음)
+                if is_handtracking:
+                    update_barcode_cam_hold(env, in_frame, BARCODE_CAM_HOLD_TIME, env.step_dt)
                 hold_s = float(get_barcode_cam_hold_time(env)[0].item())
                 in_frame_b = bool(in_frame[0].item())
 
+                laser_state = "success" if hold_s >= BARCODE_CAM_HOLD_TIME else "contact" if in_frame_b else "idle"
                 # 🔹 바코드 타겟 구의 색상 업데이트
-                set_barcode_target_color(env, in_frame_b)
-
-                frustum_vis.update(tracking_active=in_frame_b and teleoperation_active)
+                set_barcode_target_color(env, laser_state)
+                frustum_vis.update(tracking_active=in_frame_b and teleoperation_active, laser_state=laser_state)
                 if xr_hud is not None:
                     xr_hud.update(
                         teleop_active=teleoperation_active,
@@ -246,6 +381,7 @@ def main() -> None:
                         hold_s=hold_s,
                         success_flash=success_flash_steps > 0,
                     )
+                camera_previews.update()
 
                 _step_i += 1
                 if _debug_barcode and _step_i % _debug_interval == 0:
@@ -254,6 +390,7 @@ def main() -> None:
                         msg = (
                             f"[teleop][dbg] active={teleoperation_active} in_frame={in_frame_b} "
                             f"hold={hold_s:.2f}s dist={dbg['dist'][0].item():.3f} depth={dbg['depth'][0].item():.3f} "
+                            f"ray_hit={bool(dbg['ray_hit'][0].item())} ray_dist={dbg['ray_dist'][0].item():.3f} "
                             f"u={dbg['u'][0].item():.0f} v={dbg['v'][0].item():.0f} "
                             f"fov={bool(dbg['fov_in'][0].item())} pixel={bool(dbg['pixel_in'][0].item())} "
                             f"cone={bool(dbg['cone_in'][0].item())}"
@@ -267,6 +404,8 @@ def main() -> None:
                             cam_pos_xyz = [round(x, 3) for x in frustum_vis.latest_cam_pos.tolist()]
                             forward_xyz = [round(x, 3) for x in frustum_vis.latest_forward_w.tolist()]
                             comp_msg += f"\n  👉 [Robot Hand Cam] Position: {cam_pos_xyz}, Direction: {forward_xyz}"
+                        if lift_controller is not None:
+                            comp_msg += f"\n  👉 [Lift] joint={FFW_LIFT_JOINT}, target={lift_controller._target:.3f}, actual={lift_controller.current_position():.3f}"
                         
                         if comp_msg:
                             msg += comp_msg
@@ -303,6 +442,8 @@ def main() -> None:
                         )
                     env.reset()
                     hold_action = current_robot_action(env)
+                    if lift_controller is not None:
+                        lift_controller.refresh_from_robot()
                     teleoperation_active = False if is_handtracking else teleoperation_active
                     env.teleoperation_active = teleoperation_active
                     set_barcode_target_color(env, False)
@@ -311,6 +452,8 @@ def main() -> None:
                 if should_reset:
                     env.reset()
                     hold_action = current_robot_action(env)
+                    if lift_controller is not None:
+                        lift_controller.refresh_from_robot()
                     teleoperation_active = False if is_handtracking else teleoperation_active
                     env.teleoperation_active = teleoperation_active
                     set_barcode_target_color(env, False)
