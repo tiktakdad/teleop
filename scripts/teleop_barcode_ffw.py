@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
@@ -44,6 +45,12 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
 app_launcher_args = vars(args_cli)
+# XR handtracking 경로에서는 PhysX UI overlay가 keyboard 인터페이스를 요구해
+# startup 에러를 낼 수 있으므로 해당 extension을 비활성화한다.
+kit_args = (app_launcher_args.get("kit_args") or "").strip()
+_disable_physx_ui = "--/exts/omni.physx.ui/enabled=false"
+if _disable_physx_ui not in kit_args:
+    app_launcher_args["kit_args"] = f"{kit_args} {_disable_physx_ui}".strip()
 if args_cli.enable_pinocchio:
     import pinocchio  # noqa: F401
 if "handtracking" in args_cli.teleop_device.lower():
@@ -76,6 +83,7 @@ from teleop_barcode_press.mdp.barcode_cam import (
     get_barcode_cam_hold_time,
     get_barcode_cam_in_frame,
     update_barcode_cam_hold,
+    reset_barcode_cam_hold,
 )
 from teleop_barcode_press.retargeters import FfwSg2Retargeter
 from teleop_barcode_press.utils import HotReloadProxy
@@ -97,6 +105,18 @@ LIFT_MODE = os.environ.get("TELEOP_LIFT_MODE", "manual").strip().lower()
 # 그리퍼 쑥힘 임계값(0~π/4.6). 이 이상이면 주먹으로 간주.
 LIFT_FIST_THRESH = float(os.environ.get("TELEOP_LIFT_FIST_THRESH", "0.45"))
 LIFT_FIST_VEL = float(os.environ.get("TELEOP_LIFT_FIST_VEL", "0.3"))
+LIFT_START_AT_MIN = os.environ.get("TELEOP_LIFT_START_AT_MIN", "1").lower() not in ("0", "false", "no")
+TELEOP_PINCH_CONTROL = os.environ.get("TELEOP_PINCH_CONTROL", "lift").strip().lower()
+FFW_HEAD_PITCH_JOINT = os.environ.get("TELEOP_HEAD_PITCH_JOINT", "head_joint1").strip()
+HEAD_PITCH_VEL = float(os.environ.get("TELEOP_HEAD_PITCH_VEL", "0.45"))
+HEAD_UP_SIGN = float(os.environ.get("TELEOP_HEAD_UP_SIGN", "-1.0"))
+# START 직후 손 트래킹 노이즈/초기 핀치 상태로 헤드가 튀는 현상 방지용 지연.
+HEAD_PINCH_ARM_DELAY = float(os.environ.get("TELEOP_HEAD_PINCH_ARM_DELAY", "0.6"))
+# 텔레옵 시작 직후 급격한 점프를 줄이기 위한 램프업 구간(제조사 운용 가이드 정합).
+TELEOP_START_SLOW_SECONDS = float(os.environ.get("TELEOP_START_SLOW_SECONDS", "5.0"))
+TELEOP_START_MIN_BLEND = float(os.environ.get("TELEOP_START_MIN_BLEND", "0.4"))
+# true면 START/RESET/성공 시 scene hard reset(env.reset), false면 현재 포즈 유지 소프트 리셋.
+TELEOP_HARD_RESET = os.environ.get("TELEOP_HARD_RESET", "0").lower() in ("1", "true", "yes")
 
 
 def set_barcode_target_color(env, state: str | bool) -> None:
@@ -168,6 +188,28 @@ def current_robot_action(env) -> torch.Tensor:
     return torch.cat((left_pose, right_pose, hand_pos))
 
 
+def _apply_startup_blend(raw_action: torch.Tensor, hold_action: torch.Tensor, elapsed_s: float) -> torch.Tensor:
+    """Blend hand-tracking target from hold pose during startup and re-normalize wrist quaternions."""
+    if TELEOP_START_SLOW_SECONDS <= 0.0:
+        return raw_action
+    alpha = max(TELEOP_START_MIN_BLEND, min(1.0, elapsed_s / TELEOP_START_SLOW_SECONDS))
+    # Ensure device alignment (hold_action may be CPU if built before sim device init)
+    hold_action = hold_action.to(device=raw_action.device, dtype=raw_action.dtype)
+    blended = hold_action + alpha * (raw_action - hold_action)
+    # Re-normalize quaternion slices without in-place assignment (safe inside inference_mode)
+    # [L xyz(0:3), L quat(3:7), R xyz(7:10), R quat(10:14), gripper(14:16)]
+    parts: list[torch.Tensor] = []
+    cursor = 0
+    for q_start in (3, 10):
+        parts.append(blended[cursor:q_start])
+        q = blended[q_start : q_start + 4]
+        q_norm = torch.linalg.vector_norm(q)
+        parts.append(q / q_norm if float(q_norm.item()) > 1.0e-8 else q)
+        cursor = q_start + 4
+    parts.append(blended[cursor:])
+    return torch.cat(parts)
+
+
 class LiftJointController:
     def __init__(self, env):
         self._env = env
@@ -188,8 +230,17 @@ class LiftJointController:
         self.refresh_from_robot()
 
     def refresh_from_robot(self) -> None:
-        pos = self._robot.data.joint_pos[:, self._joint_id]
-        self._target = float(pos[0].item())
+        if LIFT_START_AT_MIN:
+            lower = None
+            try:
+                lower = float(self._robot.data.soft_joint_pos_limits[0, self._joint_id, 0].item())
+            except Exception:
+                pass
+            # Use the safer of configured min and robot soft lower limit to avoid ground penetration.
+            self._target = max(float(LIFT_MIN), lower) if lower is not None else float(LIFT_MIN)
+        else:
+            pos = self._robot.data.joint_pos[:, self._joint_id]
+            self._target = float(pos[0].item())
         self.reset_hand_tracking()
         self.apply()
 
@@ -222,6 +273,59 @@ class LiftJointController:
         desired = max(LIFT_MIN, min(LIFT_MAX, self._lift_base_target + (wrist_z - self._hand_base_z) * LIFT_HAND_SCALE))
         max_delta = max(0.0, LIFT_TARGET_VEL * dt)
         self._target += max(-max_delta, min(max_delta, desired - self._target))
+
+    def apply(self) -> None:
+        target = torch.full((self._env.num_envs, 1), self._target, dtype=torch.float32, device=self._env.device)
+        self._robot.set_joint_position_target(target, joint_ids=[self._joint_id])
+        try:
+            self._robot.write_data_to_sim()
+        except Exception:
+            pass
+
+
+class HeadPitchController:
+    def __init__(self, env):
+        self._env = env
+        self._robot = env.scene["robot"]
+        joint_ids, _ = self._robot.find_joints([FFW_HEAD_PITCH_JOINT], preserve_order=True)
+        if len(joint_ids) != 1:
+            raise RuntimeError(f"Unable to resolve head pitch joint: {FFW_HEAD_PITCH_JOINT}")
+        self._joint_id = joint_ids[0]
+        self._lower = None
+        self._upper = None
+        try:
+            limits = self._robot.data.soft_joint_pos_limits[0, self._joint_id]
+            self._lower = float(limits[0].item())
+            self._upper = float(limits[1].item())
+        except Exception:
+            pass
+        lim_msg = ""
+        if self._lower is not None and self._upper is not None:
+            lim_msg = f" limits=[{self._lower:.3f}, {self._upper:.3f}]"
+        print(f"[teleop] resolved head control joint '{FFW_HEAD_PITCH_JOINT}' id={self._joint_id}{lim_msg}", flush=True)
+        # Ensure first apply() uses a valid target and avoids 1-frame startup jump.
+        self.refresh_from_robot()
+
+    def _clamp(self, value: float) -> float:
+        if self._lower is not None:
+            value = max(self._lower, value)
+        if self._upper is not None:
+            value = min(self._upper, value)
+        return value
+
+    def refresh_from_robot(self) -> None:
+        # Keep target aligned with current robot state.
+        # Reset/play default head pose is defined in ffw_sg2_cfg.py init_state.
+        pos = self._robot.data.joint_pos[:, self._joint_id]
+        self._target = self._clamp(float(pos[0].item()))
+        self.apply()
+
+    def nudge(self, delta: float) -> None:
+        self._target = self._clamp(self._target + delta)
+        self.apply()
+
+    def current_position(self) -> float:
+        return float(self._robot.data.joint_pos[0, self._joint_id].item())
 
     def apply(self) -> None:
         target = torch.full((self._env.num_envs, 1), self._target, dtype=torch.float32, device=self._env.device)
@@ -296,23 +400,40 @@ def main() -> None:
 
     hold_action = None
     lift_controller: LiftJointController | None = None
+    head_controller: HeadPitchController | None = None
+    teleop_started_at: float | None = None
+    head_pinch_ready = False
 
     def start_teleoperation() -> None:
-        nonlocal teleoperation_active, should_reset, pending_start_reset
+        nonlocal teleoperation_active, should_reset, pending_start_reset, teleop_started_at, head_pinch_ready
         teleoperation_active = True
         env.teleoperation_active = True
+        teleop_started_at = time.monotonic()
+        head_pinch_ready = False
         if lift_controller is not None:
             lift_controller.reset_hand_tracking()
+        # 🔹 텔레옵 시작 시점의 손 위치를 clutch 기준점으로 재설정 (hand scale 기준 원점)
+        try:
+            if hasattr(ffw_retargeter, "reset_clutch"):
+                ffw_retargeter.reset_clutch()
+                print("Clutch reference reset to current hand pose")
+        except Exception as exc:
+            print(f"[teleop] clutch reset skipped: {exc}", flush=True)
         # record 모드: START 시 환경/레코더 버퍼를 리셋해 초기상태부터 깨끗하게 녹화 시작 (활성 유지)
         if record_mode:
-            should_reset = True
-            pending_start_reset = True
+            if TELEOP_HARD_RESET:
+                should_reset = True
+                pending_start_reset = True
+            else:
+                pending_start_reset = False
         print("Teleoperation activated - following raw hand tracking targets")
 
     def stop_teleoperation() -> None:
-        nonlocal teleoperation_active, hold_action
+        nonlocal teleoperation_active, hold_action, teleop_started_at, head_pinch_ready
         teleoperation_active = False
         env.teleoperation_active = False
+        teleop_started_at = None
+        head_pinch_ready = False
         hold_action = current_robot_action(env)
         if lift_controller is not None:
             lift_controller.reset_hand_tracking()
@@ -374,6 +495,8 @@ def main() -> None:
     teleop_interface.reset()
     hold_action = current_robot_action(env)
     lift_controller = LiftJointController(env)
+    if TELEOP_PINCH_CONTROL == "head":
+        head_controller = HeadPitchController(env)
     # record 모드에서는 노란색 구·파란 레이저(시각화 인디케이터)를 제거해 녹화 영상에 들어가지 않게 한다.
     # (상위 카메라 디스플레이/네비게이션 패널은 유지)
     if record_mode:
@@ -397,7 +520,7 @@ def main() -> None:
     print(
         f"Teleoperation started. 바코드 {BARCODE_CAM_HOLD_TIME:.1f}s 연속 인식 시 성공. "
         "파란 선=오른손 D405 정면. START=현재 손 위치에서 조작 시작. "
-        f"리프트 모드={LIFT_MODE} (manual=왼손 주먹↓/오른손 주먹↑, auto=오른손 높이 추종). "
+        f"리프트 모드={LIFT_MODE}, 핀치 제어={TELEOP_PINCH_CONTROL or 'none'}. "
         "Press 'R' to reset, STOP=일시정지."
     )
 
@@ -406,29 +529,47 @@ def main() -> None:
             with torch.inference_mode():
                 raw_action = teleop_interface.advance()
 
-                # 리프트 제어: auto=오른손 높이 추종, manual=주먹 쑥기(왼손 ↓ / 오른손 ↑)
-                if (
-                    LIFT_HANDTRACKING
-                    and teleoperation_active
-                    and is_handtracking
-                    and lift_controller is not None
-                    and "ffw_retargeter" in locals()
-                ):
-                    if LIFT_MODE == "auto" and hasattr(ffw_retargeter, "latest_right_wrist"):
-                        lift_controller.sync_to_hand_height(float(ffw_retargeter.latest_right_wrist[2]), env.step_dt)
-                    else:
-                        left_fist = float(getattr(ffw_retargeter, "latest_left_gripper", 0.0)) >= LIFT_FIST_THRESH
-                        right_fist = float(getattr(ffw_retargeter, "latest_right_gripper", 0.0)) >= LIFT_FIST_THRESH
-                        delta = LIFT_FIST_VEL * env.step_dt
-                        if right_fist and not left_fist:
-                            lift_controller.nudge(delta)
-                        elif left_fist and not right_fist:
-                            lift_controller.nudge(-delta)
+                # 핀치(집게) 기반 보조 제어: none="미사용", lift="리프트", head="헤드 피치"
+                if teleoperation_active and is_handtracking and "ffw_retargeter" in locals():
+                    left_pinch = float(getattr(ffw_retargeter, "latest_left_gripper", 0.0)) >= LIFT_FIST_THRESH
+                    right_pinch = float(getattr(ffw_retargeter, "latest_right_gripper", 0.0)) >= LIFT_FIST_THRESH
+
+                    if TELEOP_PINCH_CONTROL == "lift" and LIFT_HANDTRACKING and lift_controller is not None:
+                        if LIFT_MODE == "auto" and hasattr(ffw_retargeter, "latest_right_wrist"):
+                            lift_controller.sync_to_hand_height(float(ffw_retargeter.latest_right_wrist[2]), env.step_dt)
+                        else:
+                            delta = LIFT_FIST_VEL * env.step_dt
+                            if right_pinch and not left_pinch:
+                                lift_controller.nudge(delta)
+                            elif left_pinch and not right_pinch:
+                                lift_controller.nudge(-delta)
+                    elif TELEOP_PINCH_CONTROL == "head" and head_controller is not None:
+                        # START 직후에는 트래킹 안정화 + 중립(양손 비핀치) 확인 전까지 헤드 제어를 보류.
+                        if not head_pinch_ready:
+                            elapsed = (time.monotonic() - teleop_started_at) if teleop_started_at is not None else 0.0
+                            if elapsed < HEAD_PINCH_ARM_DELAY:
+                                pass
+                            elif not left_pinch and not right_pinch:
+                                head_pinch_ready = True
+                            else:
+                                pass
+                        elif right_pinch ^ left_pinch:
+                            delta = HEAD_PITCH_VEL * env.step_dt * max(0.1, abs(HEAD_UP_SIGN))
+                            if right_pinch:
+                                head_controller.nudge(delta * (1.0 if HEAD_UP_SIGN >= 0.0 else -1.0))
+                            else:
+                                head_controller.nudge(-delta * (1.0 if HEAD_UP_SIGN >= 0.0 else -1.0))
 
                 if success_flash_steps > 0:
                     success_flash_steps -= 1
 
                 selected_action = raw_action if teleoperation_active else hold_action
+                if teleoperation_active and is_handtracking and hold_action is not None and teleop_started_at is not None:
+                    elapsed_s = time.monotonic() - teleop_started_at
+                    if elapsed_s < TELEOP_START_SLOW_SECONDS:
+                        selected_action = _apply_startup_blend(selected_action, hold_action, elapsed_s)
+                    else:
+                        teleop_started_at = None
 
                 actions = selected_action.unsqueeze(0) if selected_action.dim() == 1 else selected_action
                 if actions.shape[0] != env.num_envs:
@@ -436,9 +577,13 @@ def main() -> None:
 
                 if lift_controller is not None:
                     lift_controller.apply()
+                if head_controller is not None:
+                    head_controller.apply()
                 step_out = env.step(actions)
                 if lift_controller is not None:
                     lift_controller.apply()
+                if head_controller is not None:
+                    head_controller.apply()
                 terminated = step_out[2] if teleoperation_active else None
 
                 # 🔹 termination 과 동일 로직으로 매 스텝 갱신 (로그/HUD용)
@@ -572,10 +717,16 @@ def main() -> None:
                             hold_s=BARCODE_CAM_HOLD_TIME,
                             success_flash=True,
                         )
-                    env.reset()
+                    if TELEOP_HARD_RESET:
+                        env.reset()
+                    else:
+                        reset_barcode_cam_hold(env)
                     hold_action = current_robot_action(env)
                     if lift_controller is not None:
                         lift_controller.refresh_from_robot()
+                    if head_controller is not None:
+                        head_controller.refresh_from_robot()
+                    head_pinch_ready = False
                     teleoperation_active = False if is_handtracking else teleoperation_active
                     env.teleoperation_active = teleoperation_active
                     set_barcode_target_color(env, False)
@@ -586,13 +737,19 @@ def main() -> None:
                         # 비-성공(수동 R/START) 시 진행 중 에피소드 버퍼를 버리고 새로 시작
                         env.recorder_manager.reset()
                         success_step_count = 0
-                    env.reset()
-                    if record_mode:
-                        # reset 후에도 노란색 구가 녹화에 들어가지 않도록 다시 숨김
-                        set_barcode_target_visible(env, False)
+                    if TELEOP_HARD_RESET:
+                        env.reset()
+                        if record_mode:
+                            # reset 후에도 노란색 구가 녹화에 들어가지 않도록 다시 숨김
+                            set_barcode_target_visible(env, False)
+                    else:
+                        reset_barcode_cam_hold(env)
                     hold_action = current_robot_action(env)
                     if lift_controller is not None:
                         lift_controller.refresh_from_robot()
+                    if head_controller is not None:
+                        head_controller.refresh_from_robot()
+                    head_pinch_ready = False
                     if record_mode:
                         # record 모드: reset 후에도 텔레옵 핸드포인트를 계속 따라가도록 활성 유지
                         # (성공/START 어느 경로든 다음 에피소드를 바로 녹화)

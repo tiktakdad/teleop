@@ -86,7 +86,9 @@ services:
     environment:
       - ACCEPT_EULA=Y
       - PRIVACY_CONSENT=Y
-      - DISPLAY=${DISPLAY:-:1}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DISPLAY=${DISPLAY:-}
       - XDG_RUNTIME_DIR=/openxr/run
       - XR_RUNTIME_JSON=/openxr/openxr_cloudxr.json
       - RUN_MODE=${RUN_MODE:-teleop}
@@ -104,13 +106,14 @@ services:
       - HAND_CAM_WIDTH=${HAND_CAM_WIDTH:-256}
       - HAND_CAM_HEIGHT=${HAND_CAM_HEIGHT:-160}
       - HIDE_HAND_MARKERS_IN_RECORD=${HIDE_HAND_MARKERS_IN_RECORD:-1}
+    runtime: nvidia
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [gpu, graphics, display]
     volumes:
       - openxr-shared:/openxr
       - /tmp/.X11-unix:/tmp/.X11-unix:rw

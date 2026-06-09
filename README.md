@@ -3,6 +3,8 @@
 NVIDIA Isaac Lab + Isaac Teleop (CloudXR) + WebXR Client를 Docker Compose로 통합 실행하는 환경입니다.
 Meta Quest 3의 광학 핸드트래킹으로 시뮬레이션 로봇을 원격 제어합니다.
 
+기본 태스크는 **AI Worker(FFW_SG2) 서버랙 바코드 프레스**(`Isaac-BarcodePress-FFW-SG2-Abs-v0`)이며, 기존 **G1 / GR1T2 Pick&Place** 태스크도 그대로 사용할 수 있습니다.
+
 ## 아키텍처
 
 Quest 브라우저는 서버와 **서로 다른 역할의 연결 3개**를 맺습니다. VR 영상·핸드 입력(UDP)과 세션 협상(WSS)을 분리하는 구조입니다.
@@ -75,6 +77,24 @@ Connect 전에 `https://<IP>:48322/` 링크로 들어가 **자체 서명 SSL 인
 | `isaac-lab` | `nvcr.io/nvidia/isaac-lab:2.3.0` | 로봇 시뮬레이션 + 텔레옵 스크립트 (GPU) |
 | `webxr-client` | 로컬 빌드 (nginx) | CloudXR WebXR 클라이언트 서빙 |
 
+## 지원 태스크
+
+| 태스크 ID | 로봇 / 씬 | 설명 |
+|-----------|-----------|------|
+| `Isaac-BarcodePress-FFW-SG2-Abs-v0` | Robotis AI Worker `FFW_SG2` + 서버랙 | **기본 태스크.** 양손 핸드트래킹으로 서버랙의 바코드를 누르는 작업. 전용 스크립트 `scripts/teleop_barcode_ffw.py`로 실행 |
+| `Isaac-PickPlace-Locomanipulation-G1-Abs-v0` | Unitree G1 | G1 Pick&Place Locomanipulation |
+| `Isaac-PickPlace-GR1T2-Abs-v0` | Fourier GR1T2 | GR1T2 Pick&Place |
+
+### AI Worker 바코드 프레스 태스크
+
+- 씬·로봇·바코드 배치는 `custom_assets/scene/reference.usd`(서버랙 + `FFW_SG2`가 배치된 authored scene)를 **단일 기준**으로 사용합니다. 로봇 reset pose / XR·handtracking anchor도 이 USD에서 자동 추출·정렬됩니다.
+- 양손 카메라(Intel RealSense D405 모사)와 헤드(POV) 카메라 영상을 화면에 프리뷰하고, 바코드까지의 방향·거리·성공 카운트를 표시하는 네비 패널을 제공합니다.
+- 리프트(`lift_joint`) 제어는 주먹 제스처로 동작합니다 (`TELEOP_LIFT_MODE`): `manual`이면 왼손 주먹 → 하강, 오른손 주먹 → 상승, `auto`이면 오른 손목 높이를 추종합니다.
+- handtracking은 **START 시점**에 현재 손 pose와 로봇 손목 pose 간 offset을 캘리브레이션하여 시작 직후 로봇이 튀지 않도록 합니다.
+- 성공 판정은 오른손 카메라 중심 광선이 바코드 타겟에 **3초간 연속 접촉**하면 트리거됩니다.
+- record 모드에서는 양손 카메라 RGB가 HDF5 `obs/left_hand_cam`, `obs/right_hand_cam`, `obs/head_cam`에 기록되며, 녹화 영상에는 손 마커·프러스텀 등 시각화 인디케이터가 제거됩니다.
+- 씬/카메라 얼라인 관련 상세 기록: [docs/troubleshoot_barcode_ffw_scene_alignment.md](docs/troubleshoot_barcode_ffw_scene_alignment.md)
+
 ## 검증 환경
 
 | 항목 | 값 |
@@ -83,7 +103,7 @@ Connect 전에 `https://<IP>:48322/` 링크로 들어가 **자체 서명 SSL 인
 | Isaac Teleop | 1.0.193 |
 | CloudXR Runtime | 6.1.0 |
 | 디바이스 프로필 | `auto-webrtc` |
-| 태스크 | `Isaac-PickPlace-GR1T2-Abs-v0` |
+| 기본 태스크 | `Isaac-BarcodePress-FFW-SG2-Abs-v0` (AI Worker FFW_SG2) |
 | 입력 장치 | Quest 3 광학 핸드트래킹 |
 | 서버 GPU | NVIDIA GeForce RTX 3090 |
 
@@ -201,24 +221,31 @@ Quest 3 브라우저에서 아래 순서대로 진행합니다:
 | `NV_DEVICE_PROFILE` | `auto-webrtc` | 디바이스 프로필 (`auto-webrtc`: Quest/Pico WebXR, `auto-native`: Apple Vision Pro) |
 | `NV_CXR_ENABLE_PUSH_DEVICES` | `false` | `false`: 헤드셋 광학 핸드트래킹, `true`: 외부 디바이스 (Manus 글러브) |
 | `RUN_MODE` | `teleop` | 실행 모드 (`teleop`: 조작, `record`: 데이터 수집) |
-| | | G1 Locomanipulation + `record` 시 **로봇 POV** (`robot_pov_cam`, 256×160 RGB)가 HDF5 `obs/`에 자동 기록 |
-| `TELEOP_TASK` | `Isaac-PickPlace-GR1T2-Abs-v0` | 텔레옵 시뮬레이션 태스크 |
+| | | 바코드 FFW 태스크는 `teleop`/`record` 모두 전용 스크립트 `scripts/teleop_barcode_ffw.py`로 실행 (record 시 양손·헤드 카메라 → HDF5 `obs/`) |
+| | | G1 Locomanipulation + `record` 시 **로봇 POV** (`robot_pov_cam`)가 HDF5 `obs/`에 자동 기록 |
+| `TELEOP_TASK` | `Isaac-BarcodePress-FFW-SG2-Abs-v0` | 텔레옵 시뮬레이션 태스크 (위 [지원 태스크](#지원-태스크) 참조) |
 | `TELEOP_DEVICE` | `handtracking` | 입력 장치 (`handtracking` / `keyboard` / `spacemouse`) |
 | `XR_HEADLESS` | `false` | `true`: `--headless --xr`로 Start AR 자동 시작 (원격 서버 권장) |
-| `RECORD_FPS` | | [수집 모드] HDF5 저장 주파수. Robotis AI Worker dataset/policy 권장값: `15` |
-| `NUM_DEMOS` | `10` | [수집 모드] 기록할 데모 수 |
-| `DATASET_FILE` | `/workspace/user/datasets/dataset.hdf5` | [수집 모드] 저장될 HDF5 파일 경로 |
+| `HEAD_CAM_WIDTH` / `HEAD_CAM_HEIGHT` | (비움) | [수집 모드] FFW 헤드(POV) 카메라 해상도. 미설정 시 `ROBOT_CAM_*` → 기본 1280×720 폴백 |
+| `HAND_CAM_WIDTH` / `HAND_CAM_HEIGHT` | `256` / `160` | [수집 모드] FFW 양손 카메라(D405) 해상도. D405 최대 RGB 1280×720 |
+| `RECORD_FPS` | `15` | [수집 모드] HDF5 저장 주파수. 비워두면 태스크 기본값. Robotis AI Worker dataset/policy 권장값: `15` |
+| `NUM_DEMOS` | `20` | [수집 모드] 기록할 데모 수 |
+| `DATASET_FILE` | `/workspace/user/datasets/dataset_barcode.hdf5` | [수집 모드] 저장될 HDF5 파일 경로 |
 | `ISAAC_LAB_VERSION` | `2.3.0` | Isaac Lab 이미지 버전 |
 | `WEBXR_HTTPS_PORT` | `8453` | WebXR 클라이언트 HTTPS 포트 |
 | `DISPLAY` | `:1` | X11 디스플레이 번호 |
 
 ## HDF5 → LeRobot 변환
 
-Isaac Lab으로 수집한 HDF5를 LeRobot v3 데이터셋으로 변환합니다. 상세: [docs/convert_to_lerobot.md](docs/convert_to_lerobot.md)
+Isaac Lab(`record_demos.py` 또는 `teleop_barcode_ffw.py --record`)으로 수집한 HDF5를 LeRobot v3 데이터셋으로 변환합니다. conda 환경(`isaaclab310`, LeRobot 0.4+)에서 동작합니다. 상세: [docs/convert_to_lerobot.md](docs/convert_to_lerobot.md)
 
 ```bash
-# 출력: workspace/datasets/<파일명>_lerobot/ (자동)
+# 출력: <hdf5와 같은 폴더>/<파일명>_lerobot_v3/ (카메라 자동 탐지)
+# G1 (기본 robot-type unitree_g1)
 ./scripts/convert_hdf5_to_lerobot.sh workspace/datasets/dataset_g1_260520_0652.hdf5
+
+# FFW 바코드 태스크 (head_cam / left_hand_cam / right_hand_cam)
+./scripts/convert_hdf5_to_lerobot.sh workspace/datasets/dataset_barcode_260529.hdf5 --robot-type ffw_sg2
 ```
 
 ## 자주 쓰는 명령어
@@ -255,6 +282,10 @@ docker compose exec isaac-teleop bash
 # custom_assets의 기존 USD를 열고 직접 저장
 ./scripts/run_scene_editor.sh \
   --open custom_assets/env/server_rack_v6.1/server_rack_teleop.usd
+
+# 서버랙 USD 내부 reference 수리 (defaultPrim instancing 시 메시가 안 보일 때)
+#   /visuals, /meshes geometry를 /network_rack 아래로 inline 복사해 teleop용 USD 생성
+python scripts/repair_server_rack_usd.py
 
 # 포트 리스닝 확인
 ss -tulnp | grep -E '(48322|49100|47998|8453)'
@@ -383,3 +414,5 @@ docker login nvcr.io
 - [CloudXR 네트워크 설정](https://docs.nvidia.com/cloudxr-sdk/latest/requirement/network_setup.html)
 - [Isaac Lab CloudXR Teleoperation](https://isaac-sim.github.io/IsaacLab/develop/source/how-to/cloudxr_teleoperation.html)
 - [Isaac Lab Mimic (모방학습)](https://isaac-sim.github.io/IsaacLab/develop/source/overview/imitation-learning/teleop_imitation.html)
+- [HDF5 → LeRobot 변환 가이드](docs/convert_to_lerobot.md)
+- [Barcode FFW 씬/카메라 얼라인 트러블슈팅](docs/troubleshoot_barcode_ffw_scene_alignment.md)

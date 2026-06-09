@@ -122,8 +122,8 @@ setup_env() {
 setup_x11() {
     info "X11 포워딩 설정 중..."
     if command -v xhost &>/dev/null; then
-        xhost +local:docker 2>/dev/null || true
-        log "X11 포워딩 활성화"
+        xhost +SI:localuser:root 2>/dev/null || true
+        log "X11 포워딩 활성화 (localuser:root)"
     else
         warn "xhost가 없습니다. GUI가 필요하면 xhost를 설치하세요."
     fi

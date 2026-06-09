@@ -37,7 +37,13 @@ class CameraPreviewDisplays:
     ):
         self._env = env
         self._camera_names = camera_names
-        self._enabled = os.environ.get("TELEOP_CAMERA_PREVIEW_DISPLAYS", "1").lower() not in ("0", "false", "no")
+        self._preview_enabled = os.environ.get("TELEOP_CAMERA_PREVIEW_DISPLAYS", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        self._nav_enabled = os.environ.get("TELEOP_NAV_PANEL", "1").lower() not in ("0", "false", "no")
+        self._enabled = self._preview_enabled or self._nav_enabled
         self._period = max(1, update_period_steps or int(os.environ.get("TELEOP_CAMERA_PREVIEW_PERIOD_STEPS", "6")))
         self._step_i = 0
         self._texture_inputs = {}
@@ -45,7 +51,6 @@ class CameraPreviewDisplays:
         # 중앙(head_cam) 디스플레이 월드 정보 (컨트롤 패널 배치용)
         self.center_display_info: dict | None = None
         # 오른손 프리뷰 하단 네비게이션/카운트 패널
-        self._nav_enabled = os.environ.get("TELEOP_NAV_PANEL", "1").lower() not in ("0", "false", "no")
         self._nav_texture_input = None
         self._nav_px = (384, 256)
         self._right_display_geom: dict | None = None
@@ -68,6 +73,9 @@ class CameraPreviewDisplays:
         gap = float(os.environ.get("TELEOP_CAMERA_PREVIEW_GAP", "0.16"))
         behind = float(os.environ.get("TELEOP_CAMERA_PREVIEW_BEHIND", "0.35"))
         up_offset = float(os.environ.get("TELEOP_CAMERA_PREVIEW_UP", "0.55"))
+        # 4개 창(좌/헤드/우 카메라 + 네비게이션)을 로봇 정면이 아닌 로봇 중심 기준 우측으로 이동.
+        # 양수 = 로봇의 오른쪽(right 벡터) 방향. 정면 배치로 되돌리려면 0 으로 설정.
+        lateral = float(os.environ.get("TELEOP_CAMERA_PREVIEW_LATERAL", "0.0"))
         anchor = os.environ.get("TELEOP_CAMERA_PREVIEW_ANCHOR", "cabinet").strip().lower()
 
         robot = np.array(robot_pos, dtype=np.float32)
@@ -100,6 +108,9 @@ class CameraPreviewDisplays:
             right = right / max(float(np.linalg.norm(right)), 1e-6)
             center = target + behind * forward + up_offset * up
 
+        # 전체 디스플레이 묶음을 로봇 우측으로 평행 이동 (right 벡터 방향)
+        center = center + lateral * right
+
         root = UsdGeom.Xform.Define(self._stage, "/World/CameraPreviewDisplays")
         root.GetPrim().SetMetadata("hide_in_stage_window", False)
 
@@ -109,25 +120,26 @@ class CameraPreviewDisplays:
         for camera_name, offset in zip(self._camera_names, offsets, strict=True):
             display_center = center + offset * right
             display_width, display_height = (hand_width, hand_height) if "hand" in camera_name else (width, height)
-            mesh_path = f"/World/CameraPreviewDisplays/{camera_name}"
-            mesh = UsdGeom.Mesh.Define(self._stage, mesh_path)
-            points = [
-                display_center - 0.5 * display_width * right - 0.5 * display_height * up,
-                display_center + 0.5 * display_width * right - 0.5 * display_height * up,
-                display_center + 0.5 * display_width * right + 0.5 * display_height * up,
-                display_center - 0.5 * display_width * right + 0.5 * display_height * up,
-            ]
-            mesh.CreatePointsAttr([Gf.Vec3f(*p.tolist()) for p in points])
-            mesh.CreateFaceVertexCountsAttr([4])
-            mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
-            mesh.CreateDoubleSidedAttr(True)
-            st = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
-                "st",
-                Sdf.ValueTypeNames.TexCoord2fArray,
-                UsdGeom.Tokens.varying,
-            )
-            st.Set([Gf.Vec2f(0.0, 1.0), Gf.Vec2f(1.0, 1.0), Gf.Vec2f(1.0, 0.0), Gf.Vec2f(0.0, 0.0)])
-            self._bind_camera_material(mesh, camera_name)
+            if self._preview_enabled:
+                mesh_path = f"/World/CameraPreviewDisplays/{camera_name}"
+                mesh = UsdGeom.Mesh.Define(self._stage, mesh_path)
+                points = [
+                    display_center - 0.5 * display_width * right - 0.5 * display_height * up,
+                    display_center + 0.5 * display_width * right - 0.5 * display_height * up,
+                    display_center + 0.5 * display_width * right + 0.5 * display_height * up,
+                    display_center - 0.5 * display_width * right + 0.5 * display_height * up,
+                ]
+                mesh.CreatePointsAttr([Gf.Vec3f(*p.tolist()) for p in points])
+                mesh.CreateFaceVertexCountsAttr([4])
+                mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+                mesh.CreateDoubleSidedAttr(True)
+                st = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+                    "st",
+                    Sdf.ValueTypeNames.TexCoord2fArray,
+                    UsdGeom.Tokens.varying,
+                )
+                st.Set([Gf.Vec2f(0.0, 1.0), Gf.Vec2f(1.0, 1.0), Gf.Vec2f(1.0, 0.0), Gf.Vec2f(0.0, 0.0)])
+                self._bind_camera_material(mesh, camera_name)
             if abs(offset) < 1e-6 or camera_name == self._camera_names[1]:
                 self.center_display_info = {
                     "center": np.array(display_center, dtype=np.float32),
@@ -146,23 +158,30 @@ class CameraPreviewDisplays:
                     "height": float(display_height),
                 }
 
-        if self._nav_enabled and self._right_display_geom is not None:
+        if self._nav_enabled and self.center_display_info is not None:
             self._define_nav_panel(gap)
 
     def _define_nav_panel(self, gap: float) -> None:
-        """오른손 프리뷰 디스플레이 바로 아래에 네비게이션/카운트 패널 생성."""
-        geom = self._right_display_geom
+        """중앙(헤드) 디스플레이 바로 위에 네비게이션/카운트 패널 생성."""
+        geom = self.center_display_info
         right = geom["right"]
         up = geom["up"]
+        forward = geom.get("forward", np.array([1.0, 0.0, 0.0], dtype=np.float32))
         panel_width = geom["width"]
         panel_height = float(os.environ.get("TELEOP_NAV_PANEL_HEIGHT", "0.34"))
-        # 오른손 디스플레이 하단 모서리에서 gap 만큼 아래로 내려 패널 중심 배치
-        panel_center = geom["center"] - (0.5 * geom["height"] + gap + 0.5 * panel_height) * up
+        # 중앙 디스플레이 상단 모서리에서 gap 만큼 위로 올려 패널 중심 배치
+        panel_center = geom["center"] + (0.5 * geom["height"] + gap + 0.5 * panel_height) * up
+        tilt_deg = float(os.environ.get("TELEOP_NAV_PANEL_TILT_DEG", "35.0"))
+        tilt_deg = max(0.0, min(80.0, tilt_deg))
+        theta = np.deg2rad(tilt_deg)
+        panel_up = np.cos(theta) * up + np.sin(theta) * forward
+        panel_up = panel_up / max(float(np.linalg.norm(panel_up)), 1e-6)
+
         points = [
-            panel_center - 0.5 * panel_width * right - 0.5 * panel_height * up,
-            panel_center + 0.5 * panel_width * right - 0.5 * panel_height * up,
-            panel_center + 0.5 * panel_width * right + 0.5 * panel_height * up,
-            panel_center - 0.5 * panel_width * right + 0.5 * panel_height * up,
+            panel_center - 0.5 * panel_width * right - 0.5 * panel_height * panel_up,
+            panel_center + 0.5 * panel_width * right - 0.5 * panel_height * panel_up,
+            panel_center + 0.5 * panel_width * right + 0.5 * panel_height * panel_up,
+            panel_center - 0.5 * panel_width * right + 0.5 * panel_height * panel_up,
         ]
         mesh = UsdGeom.Mesh.Define(self._stage, "/World/CameraPreviewDisplays/nav_panel")
         mesh.CreatePointsAttr([Gf.Vec3f(*p.tolist()) for p in points])
@@ -267,16 +286,18 @@ class CameraPreviewDisplays:
         return arr
 
     def update(self) -> None:
-        if not self._enabled:
-            return
         self._step_i += 1
+        if not self._enabled or not self._preview_enabled:
+            return
         if self._step_i % self._period != 0:
             return
 
         try:
             from PIL import Image
         except Exception:
-            self._enabled = False
+            self._preview_enabled = False
+            if not self._nav_enabled:
+                self._enabled = False
             print("[CameraPreviewDisplays] disabled: Pillow is unavailable", flush=True)
             return
 
@@ -345,9 +366,13 @@ class CameraPreviewDisplays:
         else:
             accent = (235, 210, 60)
 
-        # ── 상단: 목표 방향 화살표 ───────────────────────────────────
+        # ── 상단: 목표 방향 화살표 (거리 기반 크기, 더 극적인 변화) ───────────
         cx, cy = w * 0.5, h * 0.32
-        arrow_r = h * 0.22
+        arrow_max_dist = max(0.05, float(os.environ.get("TELEOP_NAV_ARROW_MAX_DIST_M", "1.0")))
+        dist_ratio = max(0.0, min(1.0, max(0.0, distance_m) / arrow_max_dist))
+        # 가까우면 거의 안 보이게, 멀면 크게 (비선형 스케일)
+        arrow_scale = dist_ratio ** 1.8
+        arrow_r = h * (0.008 + 0.36 * arrow_scale)
         # 디스플레이(회전+반전 적용) 화면 기준: 패널 오른쪽 = 카메라 y(아래), 패널 아래 = 카메라 x(오른쪽)
         dirx, diry = 0.0, 0.0
         if offset_cam is not None:
@@ -373,20 +398,26 @@ class CameraPreviewDisplays:
             right = (base[0] - perp[0] * arrow_r * 0.55, base[1] - perp[1] * arrow_r * 0.55)
             draw.polygon([tip, left, right], fill=accent)
 
-        # ── 거리 텍스트: 화살표 중앙에 숫자만 크게 표시 ──────────────
+        # ── 거리 텍스트: 화살표 위쪽에 크게 별도 표시 ───────────────────────
         dist_cm = max(0.0, distance_m) * 100.0
-        dist_text = "OK" if (in_frame and distance_m < 0.05) else f"{dist_cm:.0f}"
-        font_big = self._nav_font(int(h * 0.30))
+        dist_text = "OK" if (in_frame and distance_m < 0.05) else f"{dist_cm:.0f} cm"
+        number_scale = max(1.0, float(os.environ.get("TELEOP_NAV_NUMBER_SCALE", "5.0")))
+        font_big = self._nav_font(int(min(h * 0.90, h * 0.16 * number_scale)))
         font_small = self._nav_font(int(h * 0.13))
+        text_cx, text_cy = w * 0.5, h * 0.08
         if font_big is not None:
-            # 화살표 중심에 겹쳐 큰 숫자 표시 (가독성을 위해 검은 외곽선)
+            bb = draw.textbbox((text_cx, text_cy), dist_text, font=font_big, anchor="mm")
+            pad_x = max(10, int(w * 0.03))
+            pad_y = max(6, int(h * 0.02))
+            bg = [bb[0] - pad_x, bb[1] - pad_y, bb[2] + pad_x, bb[3] + pad_y]
+            draw.rounded_rectangle(bg, radius=max(6, int(h * 0.03)), fill=(8, 10, 14))
             draw.text(
-                (cx, cy),
+                (text_cx, text_cy),
                 dist_text,
                 fill=(255, 255, 255),
                 font=font_big,
                 anchor="mm",
-                stroke_width=max(2, int(h * 0.012)),
+                stroke_width=max(2, int(h * 0.01)),
                 stroke_fill=(0, 0, 0),
             )
 

@@ -10,13 +10,16 @@ from isaaclab.assets import ArticulationCfg
 CUSTOM_ASSETS_DIR = os.environ.get("CUSTOM_ASSETS_DIR", "/workspace/user/custom_assets")
 FFW_SG2_USD = os.path.join(CUSTOM_ASSETS_DIR, "robot/ai_worker/FFW_SG2.usd")
 
+# Reset/play 시 head_joint1 기본 피치(아래보기) 초기값.
+FFW_HEAD_DOWN_INIT_POS = float(os.environ.get("FFW_HEAD_DOWN_INIT_POS", "0.55"))
+
 # Match the authored articulation pose in scene/reference.usd.
 _DEFAULT_JOINT_POS = {
     **{f"arm_l_joint{i}": 0.0 for i in range(1, 8)},
     **{f"arm_r_joint{i}": 0.0 for i in range(1, 8)},
     **{f"gripper_l_joint{i}": 0.0 for i in range(1, 5)},
     **{f"gripper_r_joint{i}": 0.0 for i in range(1, 5)},
-    "head_joint1": 0.0,
+    "head_joint1": FFW_HEAD_DOWN_INIT_POS,
     "head_joint2": 0.0,
     "lift_joint": 0.0,
     "left_wheel_drive": 0.0,

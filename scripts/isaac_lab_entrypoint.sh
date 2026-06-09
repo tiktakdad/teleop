@@ -145,6 +145,46 @@ if [[ "$RUN_MODE" == "record" ]] && is_g1_task; then
 fi
 
 # 🔹 XR 세션 자동 시작 (원격 PC에서 Start AR 클릭 생략)
+# DISPLAY 가 비어 있으면 X 소켓(/tmp/.X11-unix/X*)을 보고 자동 추정한다.
+# GUI 모드를 요청했더라도 DISPLAY/X11 이 유효하지 않으면 자동으로 headless 로 전환한다.
+if [[ "${XR_HEADLESS:-false}" != "1" && "${XR_HEADLESS:-false}" != "true" && "${XR_HEADLESS:-false}" != "TRUE" && "${XR_HEADLESS:-false}" != "yes" && "${XR_HEADLESS:-false}" != "YES" ]]; then
+    if [[ -z "${DISPLAY:-}" ]]; then
+        shopt -s nullglob
+        x_sockets=(/tmp/.X11-unix/X*)
+        shopt -u nullglob
+        if [[ ${#x_sockets[@]} -gt 0 ]]; then
+            best_display=""
+            best_num=""
+            for socket_path in "${x_sockets[@]}"; do
+                socket_name="$(basename "$socket_path")"
+                socket_num="${socket_name#X}"
+                if [[ "$socket_num" =~ ^[0-9]+$ ]]; then
+                    if [[ -z "$best_num" || "$socket_num" -lt "$best_num" ]]; then
+                        best_num="$socket_num"
+                        best_display=":${socket_num}"
+                    fi
+                fi
+            done
+            if [[ -n "$best_display" ]]; then
+                export DISPLAY="$best_display"
+                echo "[isaac-lab] ✓ DISPLAY 자동 감지: $DISPLAY"
+            fi
+        fi
+    fi
+    if [[ -z "${DISPLAY:-}" ]]; then
+        echo "[isaac-lab] ! DISPLAY 미설정 — XR_HEADLESS=true 로 자동 전환"
+        XR_HEADLESS=true
+    elif [[ "${DISPLAY}" =~ ^:([0-9]+)(\.[0-9]+)?$ ]]; then
+        _disp_num="${BASH_REMATCH[1]}"
+        if [[ ! -S "/tmp/.X11-unix/X${_disp_num}" ]]; then
+            echo "[isaac-lab] ! /tmp/.X11-unix/X${_disp_num} 없음 — XR_HEADLESS=true 로 자동 전환"
+            XR_HEADLESS=true
+        elif [[ ! -r "/root/.Xauthority" ]]; then
+            echo "[isaac-lab] ! /root/.Xauthority 접근 불가 — XR_HEADLESS=true 로 자동 전환"
+            XR_HEADLESS=true
+        fi
+    fi
+fi
 # Isaac Lab: --headless + --xr → isaaclab.python.xr.openxr.headless.kit, AR 프로필 자동 활성화
 XR_LAUNCH_ARGS=()
 case "${XR_HEADLESS:-false}" in

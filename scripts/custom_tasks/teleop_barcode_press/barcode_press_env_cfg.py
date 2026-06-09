@@ -83,6 +83,13 @@ BARCODE_TARGET_RADIUS = float(os.environ.get("BARCODE_TARGET_RADIUS", "0.045"))
 BARCODE_CAM_HOLD_TIME = float(os.environ.get("BARCODE_CAM_HOLD_TIME", "3.0"))
 HAND_CAM_FRUSTUM_MAX_DEPTH = float(os.environ.get("HAND_CAM_FRUSTUM_MAX_DEPTH", "0.6"))
 
+# 🔹 Pink IK FrameTask 가중치 (팔 도달 거리 튜닝용).
+# orientation_cost 를 낮추면 IK 가 손목 자세보다 위치 추종을 우선해 팔을 더 멀리 뻗는다.
+IK_POSITION_COST = float(os.environ.get("TELEOP_IK_POSITION_COST", "8.0"))
+IK_ORIENTATION_COST = float(os.environ.get("TELEOP_IK_ORIENTATION_COST", "1.0"))
+IK_LM_DAMPING = float(os.environ.get("TELEOP_IK_LM_DAMPING", "5.0"))
+IK_GAIN = float(os.environ.get("TELEOP_IK_GAIN", "0.5"))
+
 
 def _yaw_quat_wxyz(yaw_deg: float) -> tuple[float, float, float, float]:
     import math
@@ -343,17 +350,17 @@ class ActionsCfg:
             variable_input_tasks=[
                 FrameTask(
                     FFW_LEFT_EE_LINK,
-                    position_cost=8.0,
-                    orientation_cost=1.0,
-                    lm_damping=12.0,
-                    gain=0.5,
+                    position_cost=IK_POSITION_COST,
+                    orientation_cost=IK_ORIENTATION_COST,
+                    lm_damping=IK_LM_DAMPING,
+                    gain=IK_GAIN,
                 ),
                 FrameTask(
                     FFW_RIGHT_EE_LINK,
-                    position_cost=8.0,
-                    orientation_cost=1.0,
-                    lm_damping=12.0,
-                    gain=0.5,
+                    position_cost=IK_POSITION_COST,
+                    orientation_cost=IK_ORIENTATION_COST,
+                    lm_damping=IK_LM_DAMPING,
+                    gain=IK_GAIN,
                 ),
                 DampingTask(cost=0.5),
                 NullSpacePostureTask(
@@ -363,10 +370,18 @@ class ActionsCfg:
                     controlled_joints=[
                         "arm_l_joint1",
                         "arm_l_joint2",
+                        "arm_l_joint3",
                         "arm_l_joint4",
+                        "arm_l_joint5",
+                        "arm_l_joint6",
+                        "arm_l_joint7",
                         "arm_r_joint1",
                         "arm_r_joint2",
+                        "arm_r_joint3",
                         "arm_r_joint4",
+                        "arm_r_joint5",
+                        "arm_r_joint6",
+                        "arm_r_joint7",
                     ],
                 ),
             ],

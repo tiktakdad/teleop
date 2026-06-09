@@ -1,0 +1,6 @@
+[submodule "sub_modules/robotis_lab"]
+	path = sub_modules/robotis_lab
+	url = https://github.com/ROBOTIS-GIT/robotis_lab.git
+[submodule "sub_modules/robotis_applications"]
+	path = sub_modules/robotis_applications
+	url = https://github.com/ROBOTIS-GIT/robotis_applications.git

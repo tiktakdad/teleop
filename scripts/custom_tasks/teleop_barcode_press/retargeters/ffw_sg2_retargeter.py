@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,6 +24,12 @@ class FfwSg2RetargeterCfg(RetargeterCfg):
 
     enable_visualization: bool = False
     num_open_xr_hand_joints: int = 52
+    # 손 변위(displacement) 증폭 계수. >1 이면 사람이 조금만 움직여도 로봇 팔이 더 멀리 뻗어
+    # 팔 최대 길이까지 도달하기 쉬워진다. 1.0 = 기존 절대 매핑(무변경).
+    position_scale: float = float(os.environ.get("TELEOP_HAND_POS_SCALE", "1.0"))
+    # 스케일 적용 시 기준점(clutch reference) 사용 여부. 활성화 시 텔레옵 시작/리셋 시점의
+    # 손 위치를 기준으로 변위를 증폭한다.
+    enable_clutch: bool = os.environ.get("TELEOP_HAND_CLUTCH", "1").lower() not in ("0", "false", "no")
 
 
 class FfwSg2Retargeter(RetargeterBase):
@@ -32,6 +39,10 @@ class FfwSg2Retargeter(RetargeterBase):
         self._enable_visualization = cfg.enable_visualization
         self._num_open_xr_hand_joints = cfg.num_open_xr_hand_joints
         self._sim_device = cfg.sim_device
+        self._position_scale = float(getattr(cfg, "position_scale", 1.0))
+        self._enable_clutch = bool(getattr(cfg, "enable_clutch", True))
+        # 좌/우 손목의 clutch 기준 위치 (텔레옵 시작 또는 reset_clutch() 시 재설정)
+        self._clutch_ref: dict[str, np.ndarray | None] = {"left": None, "right": None}
 
         if self._enable_visualization:
             marker_cfg = VisualizationMarkersCfg(
@@ -79,6 +90,10 @@ class FfwSg2Retargeter(RetargeterBase):
 
         left_wrist = left_hand_poses.get("wrist", np.zeros(7, dtype=np.float32))
         right_wrist = right_hand_poses.get("wrist", np.zeros(7, dtype=np.float32))
+
+        # 🔹 손 변위 스케일 + clutch 적용 (팔 최대 도달 거리 확보용)
+        left_wrist = self._apply_clutch_scale(np.asarray(left_wrist, dtype=np.float32), "left")
+        right_wrist = self._apply_clutch_scale(np.asarray(right_wrist, dtype=np.float32), "right")
 
         if self._enable_visualization:
             joints_position = np.zeros((self._num_open_xr_hand_joints, 3))
@@ -142,6 +157,35 @@ class FfwSg2Retargeter(RetargeterBase):
         pinch_dist = float(np.linalg.norm(thumb_pos - index_pos))
         closed = np.clip(1.0 - pinch_dist / 0.08, 0.0, 1.0) * _GRIPPER_CLOSED_RAD
         return float(closed)
+
+    def reset_clutch(self) -> None:
+        """현재 손 위치를 새 기준점으로 삼도록 clutch 기준을 초기화한다.
+
+        텔레옵 START/리셋 시 호출하면, 그 순간의 손 위치를 원점으로 하여
+        이후 변위에 ``position_scale`` 이 적용된다.
+        """
+        self._clutch_ref = {"left": None, "right": None}
+
+    def _apply_clutch_scale(self, wrist: np.ndarray, side: str) -> np.ndarray:
+        """손목 위치 변위에 스케일 계수를 적용한다.
+
+        ``target = ref + scale * (wrist - ref)`` 형태로, ``scale`` 이 1 보다 크면
+        같은 손 변위로 로봇 팔을 더 멀리 보낼 수 있어 팔 최대 길이까지 도달하기 쉬워진다.
+        ``scale == 1`` 또는 clutch 비활성 시에는 기존 절대 매핑과 동일하게 동작한다.
+        """
+        wrist = np.array(wrist, dtype=np.float32).copy()
+        pos = wrist[:3]
+        # 트래킹이 없거나(원점 근처) 스케일이 1 이면 변환 없이 통과
+        if float(np.linalg.norm(pos)) < 1.0e-5:
+            return wrist
+        if not self._enable_clutch or abs(self._position_scale - 1.0) < 1.0e-6:
+            return wrist
+        ref = self._clutch_ref.get(side)
+        if ref is None:
+            ref = pos.copy()
+            self._clutch_ref[side] = ref
+        wrist[:3] = ref + self._position_scale * (pos - ref)
+        return wrist
 
     def _retarget_abs(self, wrist: np.ndarray, side: str) -> np.ndarray:
         """OpenXR wrist → FFW_SG2 wrist control frame.
