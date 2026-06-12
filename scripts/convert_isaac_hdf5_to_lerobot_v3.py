@@ -36,6 +36,45 @@ EPISODES_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.par
 TASKS_PATH = "meta/tasks.parquet"
 
 
+def _names_from_attrs(h5file, attr_key: str, dim: int, fallback_prefix: str) -> list[str]:
+    """HDF5 root attrs에서 차원별 이름 목록을 읽어옵니다.
+
+    isaaclab_hdf5_tagger가 기록한 robot_joint_names / action_names를 우선 사용해
+    state/action 이름이 실제 관절 이름과 일치하도록 합니다. attrs가 없거나 길이가
+    차원과 다르면 경고 후 제네릭 이름(fallback_prefix_i)으로 폴백합니다.
+    """
+    raw = h5file.attrs.get(attr_key)
+    if raw is not None:
+        names = [n.decode() if isinstance(n, (bytes, bytearray)) else str(n) for n in raw]
+        if len(names) == dim:
+            print(f"[convert] attrs['{attr_key}'] 사용: {dim}개 이름")
+            return names
+        print(
+            f"[convert] ⚠ attrs['{attr_key}'] 길이({len(names)}) != 차원({dim}); "
+            f"제네릭 이름('{fallback_prefix}_i')으로 대체합니다."
+        )
+    else:
+        print(
+            f"[convert] ⚠ attrs['{attr_key}'] 없음; 제네릭 이름('{fallback_prefix}_i')을 사용합니다. "
+            "(isaaclab_hdf5_tagger로 태깅하면 실제 관절 이름이 반영됩니다.)"
+        )
+    return [f"{fallback_prefix}_{i}" for i in range(dim)]
+
+
+def _warn_if_action_not_joint_space(h5file) -> None:
+    """action_space_type이 관절 공간이 아니면 state/action 불일치를 경고합니다."""
+    st = h5file.attrs.get("action_space_type")
+    if st is None:
+        return
+    st = st.decode() if isinstance(st, (bytes, bytearray)) else str(st)
+    if st != "joint_position":
+        print(
+            f"[convert] ⚠ action_space_type='{st}' (관절 공간 아님). "
+            "state(관절각)와 action 표현이 다를 수 있습니다. "
+            "녹화 시 --auto_align 또는 convert_actions_to_joint_space 사용을 권장합니다."
+        )
+
+
 def _discover_cameras(grp) -> list[tuple[str, str]]:
     """obs/ 그룹에서 카메라 이미지 데이터셋을 탐지.
 
@@ -91,6 +130,9 @@ def _try_lerobot_convert(
         cam_shapes = {
             video_key: sample[obs_key].shape[1:3] for obs_key, video_key in cameras
         }
+        state_names = _names_from_attrs(f, "robot_joint_names", state_dim, "joint")
+        action_names = _names_from_attrs(f, "action_names", action_dim, "action")
+        _warn_if_action_not_joint_space(f)
 
     print(
         "[convert] 카메라: "
@@ -101,12 +143,12 @@ def _try_lerobot_convert(
         STATE_KEY: {
             "dtype": "float32",
             "shape": (state_dim,),
-            "names": [f"joint_{i}" for i in range(state_dim)],
+            "names": state_names,
         },
         ACTION_KEY: {
             "dtype": "float32",
             "shape": (action_dim,),
-            "names": [f"action_{i}" for i in range(action_dim)],
+            "names": action_names,
         },
     }
     for _obs_key, video_key in cameras:
@@ -427,6 +469,11 @@ def _standalone_convert(
     state_dim = states_cat.shape[1]
     action_dim = actions_cat.shape[1]
 
+    with h5py.File(hdf5_path, "r") as f:
+        state_names = _names_from_attrs(f, "robot_joint_names", state_dim, "joint")
+        action_names = _names_from_attrs(f, "action_names", action_dim, "action")
+        _warn_if_action_not_joint_space(f)
+
     features = {
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "frame_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -436,12 +483,12 @@ def _standalone_convert(
         STATE_KEY: {
             "dtype": "float32",
             "shape": [state_dim],
-            "names": [f"joint_{i}" for i in range(state_dim)],
+            "names": state_names,
         },
         ACTION_KEY: {
             "dtype": "float32",
             "shape": [action_dim],
-            "names": [f"action_{i}" for i in range(action_dim)],
+            "names": action_names,
         },
     }
     for vk in video_keys:

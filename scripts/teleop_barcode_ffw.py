@@ -41,6 +41,12 @@ parser.add_argument(
     default=10,
     help="성공 종료로 간주하기 위한 연속 성공 스텝 수.",
 )
+parser.add_argument(
+    "--no_tag",
+    action="store_true",
+    default=False,
+    help="record 모드 종료 시 HDF5 관절/액션 메타데이터 태깅을 건너뜁니다 (기본: 태깅 수행).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -117,6 +123,24 @@ TELEOP_START_SLOW_SECONDS = float(os.environ.get("TELEOP_START_SLOW_SECONDS", "5
 TELEOP_START_MIN_BLEND = float(os.environ.get("TELEOP_START_MIN_BLEND", "0.4"))
 # true면 START/RESET/성공 시 scene hard reset(env.reset), false면 현재 포즈 유지 소프트 리셋.
 TELEOP_HARD_RESET = os.environ.get("TELEOP_HARD_RESET", "0").lower() in ("1", "true", "yes")
+# record 모드에서 새 데모 녹화가 시작될 때 간단한 시작 사운드(터미널 벨)를 울린다.
+TELEOP_START_SOUND = os.environ.get("TELEOP_START_SOUND", "1").lower() not in ("0", "false", "no")
+# 시작 사운드로 울릴 터미널 벨(BEL) 횟수.
+TELEOP_START_SOUND_BEEPS = max(1, int(float(os.environ.get("TELEOP_START_SOUND_BEEPS", "2"))))
+
+
+def play_start_sound() -> None:
+    """record 모드 데모 시작 시 간단한 시작 사운드(ASCII BEL)를 울린다.
+
+    호스트 터미널 스피커로 비프음이 난다(Quest 헤드셋으로는 전달되지 않음).
+    USD 스테이지/렌더 파이프라인을 건드리지 않아 시뮬에 영향이 없다.
+    """
+    if not TELEOP_START_SOUND:
+        return
+    try:
+        print("\a" * TELEOP_START_SOUND_BEEPS, end="", flush=True)
+    except Exception:
+        pass
 
 
 def set_barcode_target_color(env, state: str | bool) -> None:
@@ -491,9 +515,57 @@ def main() -> None:
     success_step_count = 0
     recorded_demo_count = 0
 
+    # ── 증분 HDF5 태깅 셋업 ──
+    # 컨테이너가 SIGKILL(exit 137) 등으로 강제 종료돼도 이미 export 된 데모의
+    # 메타데이터가 보존되도록, 각 에피소드 export 직후 즉시 태깅한다.
+    # 라이브 env가 필요한 관절/액션 이름 태깅은 최초 1회만 수행하고,
+    # action→관절 공간 변환은 멱등 함수로 매번 호출한다(이미 변환된 데모는 건너뜀).
+    _tagger = None
+    _metadata_tagged = False
+    if record_mode and not args_cli.no_tag:
+        try:
+            import sys as _sys
+
+            _tagger_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "joint_targeter"
+            )
+            if _tagger_dir not in _sys.path:
+                _sys.path.insert(0, _tagger_dir)
+            from isaaclab_hdf5_tagger import IsaacLabHdf5Tagger as _tagger
+        except Exception as exc:
+            omni.log.error(f"[record] HDF5 태거 로드 실패 (태깅 비활성): {exc}")
+            _tagger = None
+
+    def _tag_after_export() -> None:
+        """에피소드 export 직후 호출: 메타데이터 태깅 + action 관절 공간 변환(멱등)."""
+        nonlocal _metadata_tagged
+        if _tagger is None:
+            return
+        try:
+            if not os.path.exists(args_cli.dataset_file):
+                return
+            if not _metadata_tagged:
+                # 라이브 env가 있어야 가능한 관절/액션 이름 태깅 (최초 1회)
+                _tagger.tag_joint_names(env, args_cli.dataset_file, robot_name="robot")
+                _tagger.tag_action_info(env, args_cli.dataset_file)
+                _metadata_tagged = True
+            # action → 관절 공간 변환 (이미 변환된 데모는 건너뜀 → 멱등)
+            _tagger.convert_actions_to_joint_space(
+                args_cli.dataset_file, robot_name="robot", verbose=False
+            )
+        except Exception as exc:
+            omni.log.error(f"[record] 증분 태깅 실패 (데이터는 보존됨): {exc}")
+
     env.reset()
     teleop_interface.reset()
     hold_action = current_robot_action(env)
+
+    robot = env.scene["robot"]
+    _ee_body_ids, _ = robot.find_bodies(FFW_EE_LINKS, preserve_order=True)
+    _ee_cam_by_side = {
+        "left": "left_hand_cam",
+        "right": "right_hand_cam",
+    }
     lift_controller = LiftJointController(env)
     if TELEOP_PINCH_CONTROL == "head":
         head_controller = HeadPitchController(env)
@@ -502,11 +574,20 @@ def main() -> None:
     if record_mode:
         set_barcode_target_visible(env, False)
         frustum_vis = None
+        frustum_vis_left = None
     else:
         set_barcode_target_color(env, False)
+        # 🔹 양손 모두 파란 레이저/성공 시각화 (어느 손이든 바코드 인식 가능)
         frustum_vis = HandCamFrustumVisualizer(
             env,
             camera_name="right_hand_cam",
+            margin_frac=BARCODE_CAM_MARGIN,
+            min_depth=BARCODE_CAM_MIN_DEPTH,
+            max_depth=HAND_CAM_FRUSTUM_MAX_DEPTH,
+        )
+        frustum_vis_left = HandCamFrustumVisualizer(
+            env,
+            camera_name="left_hand_cam",
             margin_frac=BARCODE_CAM_MARGIN,
             min_depth=BARCODE_CAM_MIN_DEPTH,
             max_depth=HAND_CAM_FRUSTUM_MAX_DEPTH,
@@ -519,10 +600,16 @@ def main() -> None:
     )
     print(
         f"Teleoperation started. 바코드 {BARCODE_CAM_HOLD_TIME:.1f}s 연속 인식 시 성공. "
-        "파란 선=오른손 D405 정면. START=현재 손 위치에서 조작 시작. "
+        "파란 선=양손 D405 정면. START=현재 손 위치에서 조작 시작. "
         f"리프트 모드={LIFT_MODE}, 핀치 제어={TELEOP_PINCH_CONTROL or 'none'}. "
         "Press 'R' to reset, STOP=일시정지."
     )
+
+    # 시뮬레이션 스텝 강건성: 카메라 렌더 일시 글리치(env.reset 직후 빈 버퍼 등)
+    # 같은 복구 가능한 예외는 해당 스텝만 건너뛰고 계속 진행한다. 강제 종료하지
+    # 않으므로 카메라가 다시 정상 렌더되면 자동으로 복구된다.
+    step_error_count = 0
+    STEP_ERROR_LOG_INTERVAL = 30  # 에러 로그 폭주 방지용 출력 간격(스텝)
 
     while simulation_app.is_running():
         try:
@@ -593,6 +680,20 @@ def main() -> None:
                     min_depth=BARCODE_CAM_MIN_DEPTH,
                     max_depth=BARCODE_CAM_MAX_DEPTH,
                 )
+                _dbg_nav = get_barcode_cam_debug(env) or {}
+                _per_cam = _dbg_nav.get("per_camera", {})
+
+                # per-camera ray_hit OR 를 in_frame 에 다시 반영해 인디케이터/타이머 판정을 일치시킨다.
+                _in_frame_from_cam = None
+                for _info in _per_cam.values():
+                    _ray_hit = _info.get("ray_hit")
+                    if _ray_hit is None:
+                        continue
+                    _ray_hit_b = _ray_hit.to(dtype=torch.bool)
+                    _in_frame_from_cam = _ray_hit_b if _in_frame_from_cam is None else (_in_frame_from_cam | _ray_hit_b)
+                if _in_frame_from_cam is not None:
+                    in_frame = _in_frame_from_cam
+
                 # 성공 종료조건을 비활성화한 핸드 트래킹 모드에서는 홀드 타이머를 수동 누적
                 # (3초 유지 시 인디케이터만 초록색으로 바뀌고 env.reset()은 하지 않음)
                 if is_handtracking:
@@ -600,12 +701,35 @@ def main() -> None:
                 hold_s = float(get_barcode_cam_hold_time(env)[0].item())
                 in_frame_b = bool(in_frame[0].item())
 
-                laser_state = "success" if hold_s >= BARCODE_CAM_HOLD_TIME else "contact" if in_frame_b else "idle"
+                hold_done = hold_s >= BARCODE_CAM_HOLD_TIME
+                laser_state = "success" if hold_done else "contact" if in_frame_b else "idle"
                 # 🔹 바코드 타겟 구의 색상 업데이트 (record 모드에서는 인디케이터를 숨기므로 생략)
                 if not record_mode:
                     set_barcode_target_color(env, laser_state)
+                # 🔹 양손 레이저를 각 손의 인식 상태에 따라 개별 갱신
+
+                def _hand_in(cam_name):
+                    info = _per_cam.get(cam_name)
+                    if info is None:
+                        return in_frame_b
+                    return bool(info["ray_hit"][0].item())
+
+                def _hand_state(cam_name):
+                    hin = _hand_in(cam_name)
+                    if hold_done and hin:
+                        return "success"
+                    return "contact" if hin else "idle"
+
                 if frustum_vis is not None:
-                    frustum_vis.update(tracking_active=in_frame_b and teleoperation_active, laser_state=laser_state)
+                    frustum_vis.update(
+                        tracking_active=_hand_in("right_hand_cam") and teleoperation_active,
+                        laser_state=_hand_state("right_hand_cam"),
+                    )
+                if frustum_vis_left is not None:
+                    frustum_vis_left.update(
+                        tracking_active=_hand_in("left_hand_cam") and teleoperation_active,
+                        laser_state=_hand_state("left_hand_cam"),
+                    )
                 if xr_hud is not None:
                     xr_hud.update(
                         teleop_active=teleoperation_active,
@@ -615,14 +739,30 @@ def main() -> None:
                     )
                 camera_previews.update()
 
-                # 🔹 오른손 프리뷰 하단: 목표(노란 구)까지 방향/거리 + 카운트 표시
-                _dbg_nav = get_barcode_cam_debug(env)
-                if _dbg_nav is not None and "p_cam" in _dbg_nav:
-                    _offset_cam = _dbg_nav["p_cam"][0].detach().cpu().numpy()
-                    _dist_m = float(_dbg_nav["dist"][0].item())
-                else:
-                    _offset_cam = None
-                    _dist_m = 0.0
+                # 🔹 네비게이션 기준 손 선택: 로봇 양손 EE 중 barcode target 과 실제 거리(월드 좌표)가 더 가까운 손 우선
+                _offset_cam = None
+                _dist_m = 0.0
+                if _dbg_nav and len(_ee_body_ids) == 2:
+                    _target_w = env.scene["barcode_target"].data.root_pos_w[0]
+                    _l_ee_w = robot.data.body_pos_w[0, _ee_body_ids[0]]
+                    _r_ee_w = robot.data.body_pos_w[0, _ee_body_ids[1]]
+                    _l_dist = float(torch.linalg.norm(_target_w - _l_ee_w).item())
+                    _r_dist = float(torch.linalg.norm(_target_w - _r_ee_w).item())
+                    _primary_cam = _ee_cam_by_side["left"] if _l_dist <= _r_dist else _ee_cam_by_side["right"]
+                    _secondary_cam = _ee_cam_by_side["right"] if _primary_cam == _ee_cam_by_side["left"] else _ee_cam_by_side["left"]
+
+                    for _cam_name in (_primary_cam, _secondary_cam):
+                        _info = _per_cam.get(_cam_name)
+                        if _info is None or "p_cam" not in _info or "dist" not in _info:
+                            continue
+                        _offset_cam = _info["p_cam"][0].detach().cpu().numpy()
+                        _dist_m = float(_info["dist"][0].item())
+                        break
+
+                    if _offset_cam is None and "p_cam" in _dbg_nav:
+                        # per_camera 누락 시(구버전/예외) 대표 metric 으로 폴백
+                        _offset_cam = _dbg_nav["p_cam"][0].detach().cpu().numpy()
+                        _dist_m = float(_dbg_nav["dist"][0].item())
                 camera_previews.update_nav_panel(
                     offset_cam=_offset_cam,
                     distance_m=_dist_m,
@@ -644,6 +784,17 @@ def main() -> None:
                             f"fov={bool(dbg['fov_in'][0].item())} pixel={bool(dbg['pixel_in'][0].item())} "
                             f"cone={bool(dbg['cone_in'][0].item())}"
                         )
+                        # 🔹 양손 카메라 각각의 버퍼 유효성(valid)·ray_hit·dist 를 표시하여
+                        # 어느 카메라가 비어 있는지(empty dict 반환) 진단한다.
+                        for _cname, _cm in (dbg.get("per_camera", {}) or {}).items():
+                            try:
+                                msg += (
+                                    f"\n    └ {_cname}: valid={bool(_cm['valid'][0].item())} "
+                                    f"ray_hit={bool(_cm['ray_hit'][0].item())} dist={_cm['dist'][0].item():.3f} "
+                                    f"depth={_cm['depth'][0].item():.3f}"
+                                )
+                            except Exception:
+                                pass
                         
                         # 🔹 [비교 디버그 로그] 실시간 손 추적 좌표 vs 로봇 손 카메라(레이저 가이드) 좌표 비교 출력
                         comp_msg = ""
@@ -683,6 +834,8 @@ def main() -> None:
                                 torch.tensor([[True]], dtype=torch.bool, device=env.device),
                             )
                             env.recorder_manager.export_episodes([0])
+                            # 강제 종료에도 보존되도록 export 직후 즉시 태깅한다.
+                            _tag_after_export()
                             success_flash_steps = 30
                             should_reset = True
                             print(
@@ -706,7 +859,7 @@ def main() -> None:
                     and hasattr(terminated, "any")
                     and terminated.any()
                 ):
-                    msg = f"[teleop] ✓ 오른손 카메라 {BARCODE_CAM_HOLD_TIME:.1f}s 연속 인식 — 성공!"
+                    msg = f"[teleop] ✓ 양손 카메라 {BARCODE_CAM_HOLD_TIME:.1f}s 연속 인식 — 성공!"
                     print(msg, flush=True)
                     omni.log.info(msg)
                     success_flash_steps = 30
@@ -763,9 +916,43 @@ def main() -> None:
                     should_reset = False
                     last_countdown_sec = -1
                     print("Environment reset complete")
+                    if record_mode:
+                        # 새 데모 녹화가 시작됨을 알리는 시작 사운드
+                        play_start_sound()
+                        print("[record] ▶ 다음 데모 녹화 시작 — 시작 사운드", flush=True)
+
+            # 정상 스텝 완료 → 에러 카운터 리셋
+            step_error_count = 0
         except Exception as exc:
-            omni.log.error(f"Error during simulation step: {exc}")
-            break
+            step_error_count += 1
+            if step_error_count == 1:
+                # 첫 실패는 근본 원인 추적을 위해 전체 traceback을 남긴다.
+                import traceback as _tb
+                omni.log.error(
+                    f"Error during simulation step: {exc}\n{_tb.format_exc()}"
+                )
+            elif step_error_count % STEP_ERROR_LOG_INTERVAL == 0:
+                # 동일 글리치가 지속되면 일정 간격으로만 요약 로그를 남긴다.
+                omni.log.warn(
+                    f"Recoverable simulation step error x{step_error_count} (계속 진행): {exc}"
+                )
+            # 복구 가능한 글리치로 보고 이 스텝만 건너뛴 뒤 계속 진행한다.
+            # (강제 종료하지 않음 → 카메라 렌더가 회복되면 자동으로 정상화)
+            continue
+
+    # ── HDF5 관절/액션 메타데이터 태깅 ──
+    # record 모드로 수집한 데이터셋에 로봇 관절 이름과 state/action 메타데이터를
+    # 기록한다. FFW 태스크의 action은 Pink IK(EEF pose)이고 state는 관절각이라
+    # 표현이 다르므로, auto_align=True로 action을 obs/robot_joint_pos[t+1] 기반
+    # 관절 공간으로 변환(원본은 actions_original 백업)해 state/action을 동일한
+    # 관절 이름 체계로 정렬한다. 태깅 실패가 수집 데이터를 깨지 않도록 감싼다.
+    if record_mode and not args_cli.no_tag:
+        print(
+            f"[record] HDF5 메타데이터 최종 태깅 → {args_cli.dataset_file}",
+            flush=True,
+        )
+        _tag_after_export()
+        print("[record] 최종 태깅 완료", flush=True)
 
     env.close()
 

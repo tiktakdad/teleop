@@ -219,9 +219,15 @@ root attrs:
   conversion_source   = "obs/robot_joint_pos[t+1]"         # 변환 소스 기록
 
 data/demo_X:
-  actions             = shape (T, 43)                       # 변환됨
-  actions_original    = shape (T, 32)                       # 원본 백업
+  actions                     = shape (T, 43)               # 변환됨
+  actions_original            = shape (T, 32)               # 원본 백업
+  processed_actions           = shape (T, 43)               # 함께 변환됨 (있을 때)
+  processed_actions_original  = shape (T, 32)               # 원본 백업
 ```
+
+> `actions`와 `processed_actions`가 모두 존재하면 둘 다 같은 관절 공간 값으로 변환되고,
+> 각각 `*_original`로 백업됩니다. LeRobot 변환기가 action 소스로 `processed_actions`를
+> 사용하므로 둘을 함께 맞춰야 state/action 이름·차원이 일치합니다.
 
 ---
 
@@ -290,3 +296,47 @@ action_names의 길이와 실제 action 차원이 항상 일치하므로 추가 
 | Joint teleop (direct) | 43 | joint_position | ✅ | ✅ RELATIVE 정상 |
 | 단일 팔 (Franka 등) | 7 | joint_position | ✅ | ✅ |
 | DifferentialIK | 6~7 | eef_pose | ❌ | ⚠ 불일치 주의 |
+
+
+---
+
+## teleop_barcode_ffw 데이터 수집 연동
+
+`scripts/teleop_barcode_ffw.py --record`로 수집할 때, 메인 루프 종료 후 `env.close()`
+직전에 태거가 자동 호출됩니다. FFW 태스크는 action이 Pink IK(EEF pose), state가 관절각
+이라 표현이 달라 그대로 저장하면 관절 이름이 매칭되지 않으므로, `auto_align=True`로
+관절 공간 변환까지 수행합니다.
+
+```bash
+# 기본: 수집 종료 시 자동 태깅 + 관절 공간 정렬
+python scripts/teleop_barcode_ffw.py --record --dataset_file /path/dataset.hdf5
+
+# 태깅을 건너뛰려면 --no_tag
+python scripts/teleop_barcode_ffw.py --record --dataset_file /path/dataset.hdf5 --no_tag
+```
+
+내부 호출(요약):
+
+```python
+from isaaclab_hdf5_tagger import IsaacLabHdf5Tagger
+IsaacLabHdf5Tagger.tag_all(env, args_cli.dataset_file, robot_name="robot", auto_align=True)
+```
+
+저장 결과(예: state 31관절 / action 16D IK):
+
+| 항목 | 태깅 전 | 태깅 후 |
+|---|---|---|
+| `robot_joint_names` (root attr) | 없음 | 31개 관절 이름 |
+| `action_names` (root attr) | 없음 | 31개 (robot_joint_names와 동일) |
+| `action_space_type` | 없음 | `joint_position` |
+| `conversion_source` | 없음 | `obs/robot_joint_pos[t+1]` |
+| `original_action_dim` | 없음 | 16 |
+| `data/demo_X/actions` | (T, 16) IK | (T, 31) 관절 |
+| `data/demo_X/processed_actions` | (T, 16) IK | (T, 31) 관절 |
+| `*_original` 백업 | 없음 | (T, 16) 원본 |
+
+- 태깅은 `record` 모드에서만 동작하며 `--no_tag`로 비활성화할 수 있습니다.
+- 태깅 실패는 try/except로 감싸 수집된 HDF5 데이터를 손상시키지 않습니다.
+- LeRobot 변환기(`scripts/convert_isaac_hdf5_to_lerobot.py`, `..._v3.py`)는 root attrs의
+  `robot_joint_names`/`action_names`를 읽어 feature 이름에 반영하며, attrs가 없으면
+  경고 후 제네릭 이름으로 폴백합니다(기존 데이터셋 호환).

@@ -16,13 +16,13 @@ if TYPE_CHECKING:
 
 def barcode_in_hand_cam(
     env: ManagerBasedRLEnv,
-    camera_cfg: SceneEntityCfg = SceneEntityCfg("right_hand_cam"),
+    camera_cfg=None,
     target_cfg: SceneEntityCfg = SceneEntityCfg("barcode_target"),
     margin_frac: float = 0.15,
     min_depth: float = 0.08,
     max_depth: float = 2.5,
 ) -> torch.Tensor:
-    """오른손 핸드 카메라 화면에 바코드가 들어오면 즉시 성공 (홀드 없음)."""
+    """양손 중 어느 한쪽 핸드 카메라 화면에 바코드가 들어오면 즉시 성공 (홀드 없음)."""
     return barcode_in_frame_mask(
         env,
         camera_cfg=camera_cfg,
@@ -35,14 +35,14 @@ def barcode_in_hand_cam(
 
 def barcode_in_hand_cam_hold(
     env: ManagerBasedRLEnv,
-    camera_cfg: SceneEntityCfg = SceneEntityCfg("right_hand_cam"),
+    camera_cfg=None,
     target_cfg: SceneEntityCfg = SceneEntityCfg("barcode_target"),
     margin_frac: float = 0.15,
     min_depth: float = 0.08,
     max_depth: float = 2.5,
     hold_time_s: float = 2.0,
 ) -> torch.Tensor:
-    """바코드가 연속으로 hold_time_s 초 동안 카메라 안에 있으면 성공."""
+    """바코드가 연속으로 hold_time_s 초 동안 (양손 중 어느 한쪽) 카메라 안에 있으면 성공."""
     in_frame = barcode_in_frame_mask(
         env,
         camera_cfg=camera_cfg,

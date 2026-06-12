@@ -233,6 +233,7 @@ class IsaacLabHdf5Tagger:
         robot_name: str = "robot",
         obs_key: str = "robot_joint_pos",
         backup: bool = True,
+        verbose: bool = True,
     ) -> bool:
         """HDF5의 action을 관절 공간으로 변환합니다.
 
@@ -288,22 +289,42 @@ class IsaacLabHdf5Tagger:
                 print(f"[Tagger] obs/{obs_key} 가 없습니다. 변환 불가.")
                 return False
 
-            old_action_dim = demo0["actions"].shape[1]
             joint_dim = demo0["obs"][obs_key].shape[1]
             num_demos = len(demo_keys)
 
-            print(f"[Tagger] action 변환 시작")
-            print(f"  변환 전: actions {old_action_dim}D")
-            print(f"  변환 후: actions {joint_dim}D (obs/{obs_key}에서)")
-            print(f"  대상: {num_demos}개 에피소드")
+            # 멱등성: 변환 전 원래 차원은 기존 attr 또는 백업(actions_original)에서
+            # 복원한다. 매 에피소드 export 직후 반복 호출해도 안전하도록 한다.
+            if "original_action_dim" in f.attrs:
+                old_action_dim = int(f.attrs["original_action_dim"])
+            elif "actions_original" in demo0:
+                old_action_dim = demo0["actions_original"].shape[1]
+            else:
+                old_action_dim = demo0["actions"].shape[1]
 
+            if verbose:
+                print(f"[Tagger] action 변환 시작")
+                print(f"  변환 전: actions {old_action_dim}D")
+                print(f"  변환 후: actions {joint_dim}D (obs/{obs_key}에서)")
+                print(f"  대상: {num_demos}개 에피소드")
+
+            # actions뿐 아니라 processed_actions도 함께 변환한다.
+            # LeRobot 변환기는 action 소스로 processed_actions를 사용하므로,
+            # 둘 다 관절 공간으로 맞춰야 state/action 이름·차원이 일치한다.
+            # (각 데이터셋은 *_original 로 백업)
+            action_dataset_keys = ["actions", "processed_actions"]
             converted_count = 0
+            skipped_count = 0
             for demo_key in demo_keys:
                 demo = data[demo_key]
-                actions_old = demo["actions"][:]
+
+                # 이미 변환된 데모(actions_original 존재)는 건너뛴다 → 멱등.
+                if "actions_original" in demo:
+                    skipped_count += 1
+                    continue
+
                 joint_pos = demo["obs"][obs_key][:]
 
-                T = actions_old.shape[0]
+                T = joint_pos.shape[0]
 
                 new_actions = np.zeros((T, joint_dim), dtype=np.float32)
                 if T > 1:
@@ -312,11 +333,14 @@ class IsaacLabHdf5Tagger:
                 elif T == 1:
                     new_actions[0] = joint_pos[0]
 
-                if backup and "actions_original" not in demo:
-                    demo.create_dataset("actions_original", data=actions_old)
-
-                del demo["actions"]
-                demo.create_dataset("actions", data=new_actions)
+                for akey in action_dataset_keys:
+                    if akey not in demo:
+                        continue
+                    backup_key = f"{akey}_original"
+                    if backup and backup_key not in demo:
+                        demo.create_dataset(backup_key, data=demo[akey][:])
+                    del demo[akey]
+                    demo.create_dataset(akey, data=new_actions)
 
                 if "num_samples" in demo.attrs:
                     demo.attrs["num_samples"] = T
@@ -334,7 +358,8 @@ class IsaacLabHdf5Tagger:
 
             f.attrs["action_names"] = np.array(joint_names, dtype="S")
             f.attrs["action_space_type"] = "joint_position"
-            f.attrs["original_action_dim"] = old_action_dim
+            if "original_action_dim" not in f.attrs:
+                f.attrs["original_action_dim"] = old_action_dim
             f.attrs["conversion_source"] = f"obs/{obs_key}[t+1]"
 
             converted_term_info = [{
@@ -346,13 +371,14 @@ class IsaacLabHdf5Tagger:
             }]
             f.attrs["action_term_info"] = json.dumps(converted_term_info, indent=2)
 
-        print(f"\n{'=' * 70}")
-        print(f"[Tagger] action -> 관절 공간 변환 완료")
-        print(f"  {old_action_dim}D (EEF/혼합) -> {joint_dim}D (관절 위치)")
-        print(f"  {converted_count}/{num_demos}개 에피소드 변환됨")
-        print(f"  원본 백업: {'actions_original에 저장' if backup else '없음'}")
-        print(f"  action[t] = obs/{obs_key}[t+1]")
-        print(f"{'=' * 70}\n")
+        if verbose:
+            print(f"\n{'=' * 70}")
+            print(f"[Tagger] action -> 관절 공간 변환 완료")
+            print(f"  {old_action_dim}D (EEF/혼합) -> {joint_dim}D (관절 위치)")
+            print(f"  {converted_count}개 신규 변환 / {skipped_count}개 기변환(건너뜀) / 총 {num_demos}개")
+            print(f"  원본 백업: {'actions_original에 저장' if backup else '없음'}")
+            print(f"  action[t] = obs/{obs_key}[t+1]")
+            print(f"{'=' * 70}\n")
 
         return True
 

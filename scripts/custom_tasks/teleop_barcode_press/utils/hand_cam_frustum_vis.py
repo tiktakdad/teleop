@@ -143,9 +143,11 @@ class HandCamFrustumVisualizer:
         idle_color = (0.15, 0.55, 1.0)
         contact_color = (1.0, 0.82, 0.08)
         success_color = (0.1, 0.9, 0.35)
+        # 🔹 양손 동시 시각화를 위해 카메라별로 고유 prim path 사용 (좌/우 마커 충돌 방지)
+        side_tag = "r" if ("right" in camera_name or "_r" in camera_name) else "l" if ("left" in camera_name or "_l" in camera_name) else camera_name
         self._markers = VisualizationMarkers(
             VisualizationMarkersCfg(
-                prim_path="/Visuals/hand_cam_frustum",
+                prim_path=f"/Visuals/hand_cam_frustum_{side_tag}",
                 markers={
                     "laser_idle": sim_utils.CuboidCfg(
                         size=(0.006, 0.006, 1.0),
@@ -241,7 +243,20 @@ class HandCamFrustumVisualizer:
         device = self._env.device
         cam_pos, cam_quat = self._resolve_camera_pose(camera)
 
-        K = camera.data.intrinsic_matrices[0]
+        # 🔹 카메라 렌더 버퍼가 아직 안 채워진 프레임(특히 양손 카메라가 간헐적으로
+        # size 0 RGB 버퍼를 반환)에서는 camera.data 접근이 RuntimeError 를 던질 수
+        # 있다. 레이저 위치/방향은 손목 링크 포즈(cam_pos/cam_quat)만으로 충분하므로
+        # 카메라 intrinsic 은 선택적으로만 사용하고, 실패해도 이 프레임만 건너뛴다.
+        # (이 예외가 메인 루프까지 전파되면 한쪽 손 레이저·네비게이션 갱신이 멈춘다)
+        if cam_pos is None or cam_quat is None:
+            self._markers.set_visibility(False)
+            return
+
+        K = None
+        try:
+            K = camera.data.intrinsic_matrices[0]
+        except Exception:
+            K = None
 
         # 🔹 외부 디버그 출력용 데이터 보관
         self.latest_cam_pos = cam_pos.clone()
@@ -250,7 +265,9 @@ class HandCamFrustumVisualizer:
             self._step_i = 0
         self._step_i += 1
 
-        if not torch.isfinite(cam_pos).all() or not torch.isfinite(K).all():
+        cam_pos_ok = torch.isfinite(cam_pos).all()
+        K_ok = (K is None) or torch.isfinite(K).all()
+        if not cam_pos_ok or not K_ok:
             self._markers.set_visibility(False)
             return
 

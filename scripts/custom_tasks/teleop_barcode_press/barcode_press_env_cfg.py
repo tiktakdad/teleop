@@ -59,10 +59,12 @@ FFW_FIXED_JOINTS = [
 # Fallback for old/broken reference scenes. Normal operation reads this from reference.usd.
 _FALLBACK_REFERENCE_ROBOT_POS = (1.4304832140901735, 0.0, 0.0)
 _FALLBACK_REFERENCE_ROBOT_ROT = (0.0, 0.0, 0.0, 1.0)
-# reference.usd 안에서 노란색 바코드 태그(prim 이름에 "barcode" 포함) Mesh 를 자동 탐지하지 못할 때 사용하는 폴백 좌표.
+# reference.usd 안에서 노란색 바코드 태그(prim 이름 = "location_barcode") Mesh 를 자동 탐지하지 못할 때 사용하는 폴백 좌표.
 _FALLBACK_BARCODE_TARGET_POS = (0.3542, 0.1996, 1.5855)
+# 🔹 성공 판정 대상이 되는 타겟 바코드 prim 이름 (서버랙 모델 변경 정합). location_barcode02 등과 구분된다.
+_BARCODE_TARGET_PRIM_NAME = "location_barcode"
 # 이름에 아래 키워드가 들어간 prim 을 바코드 태그로 간주 (서버랙 모델이 바뀌어도 자동 추적)
-_BARCODE_PRIM_KEYWORDS = ("barcodeplane", "barcode", "device_barc")
+_BARCODE_PRIM_KEYWORDS = ("location_barcode", "barcodeplane", "barcode", "device_barc")
 
 HAND_CAM_WIDTH = int(os.environ.get("HAND_CAM_WIDTH", "256"))
 HAND_CAM_HEIGHT = int(os.environ.get("HAND_CAM_HEIGHT", "160"))
@@ -169,8 +171,13 @@ def _reference_robot_pose() -> tuple[tuple[float, float, float], tuple[float, fl
 
 
 def _find_barcode_prim(stage):
-    """이름에 바코드 키워드가 들어간 렌더 가능한 Mesh prim 을 탐색."""
+    """타겟 바코드(location_barcode) prim 을 우선 탐색하고, 없으면 키워드 매칭으로 탐색."""
     from pxr import UsdGeom
+
+    # 🔹 타겟 바코드는 이름이 정확히 일치하는 prim 을 우선한다 (location_barcode02 등과 구분).
+    exact = _find_prim_by_name(stage, _BARCODE_TARGET_PRIM_NAME)
+    if exact is not None and exact.IsValid():
+        return exact
 
     fallback = None
     for prim in stage.Traverse():
@@ -399,8 +406,16 @@ def safe_image(env, sensor_cfg, data_type="rgb", normalize=False):
             return val
     except Exception:
         pass
+    # 폴백: 렌더 버퍼가 비어 있을 때 0-패딩 텐서를 반환한다.
+    # 주의 — sensor.data 접근은 동일한 버퍼 갱신(_update_buffers_impl) 크래시를
+    # 재유발하므로(렌더 리소스가 비어 있을 때 [720,1280,3] expand 실패) 절대
+    # 건드리지 않고, 해상도는 센서 cfg(고정 width/height)에서 직접 읽는다.
     sensor = env.scene[sensor_cfg.name]
-    h, w = sensor.data.image_shape
+    try:
+        h = int(sensor.cfg.height)
+        w = int(sensor.cfg.width)
+    except Exception:
+        h, w = 0, 0
     c = 3 if data_type == "rgb" else 1
     device = env.device
     # ObservationManager가 단일 env일 때 (H, W, C) 형태를 기대하는 케이스가 있어
@@ -450,7 +465,7 @@ def _barcode_success_done_term() -> DoneTerm:
     return DoneTerm(
         func=mdp.barcode_in_hand_cam_hold,
         params={
-            "camera_cfg": SceneEntityCfg("right_hand_cam"),
+            # camera_cfg 미지정 → 양손(right/left hand cam) 모두 검사
             "target_cfg": SceneEntityCfg("barcode_target"),
             "margin_frac": BARCODE_CAM_MARGIN,
             "min_depth": BARCODE_CAM_MIN_DEPTH,
@@ -469,6 +484,7 @@ class TerminationsCfg:
 @configclass
 class EventCfg:
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+    randomize_barcode_planes = EventTerm(func=mdp.randomize_barcode_planes_on_front_cover, mode="reset")
     reset_barcode_hold = EventTerm(func=mdp.reset_barcode_cam_hold, mode="reset")
 
 
