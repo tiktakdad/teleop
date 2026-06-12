@@ -907,6 +907,8 @@ def main() -> None:
                         # record 모드: reset 후에도 텔레옵 핸드포인트를 계속 따라가도록 활성 유지
                         # (성공/START 어느 경로든 다음 에피소드를 바로 녹화)
                         teleoperation_active = True
+                        teleop_started_at = time.monotonic()  # 헤드 핀치 delay 타이머 초기화
+                        head_pinch_ready = False  # 헤드 핀치 준비 상태 초기화
                     else:
                         teleoperation_active = False if is_handtracking else teleoperation_active
                     env.teleoperation_active = teleoperation_active

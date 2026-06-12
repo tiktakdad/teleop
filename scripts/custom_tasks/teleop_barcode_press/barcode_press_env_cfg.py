@@ -399,18 +399,49 @@ class ActionsCfg:
 
 
 def safe_image(env, sensor_cfg, data_type="rgb", normalize=False):
-    """헤드리스/XR 구동 조건에 따라 비어 있을 수 있는 카메라 RGB 버퍼를 안전하게 0-패딩 텐서로 대체해 시뮬레이터 크래시를 방지합니다."""
+    """카메라 이미지 조회 실패 시 강제 업데이트를 1회 재시도하고, 계속 실패하면 0-패딩으로 폴백한다."""
+
+    def _is_valid_image(tensor) -> bool:
+        return tensor is not None and hasattr(tensor, "numel") and tensor.numel() > 0
+
+    sensor_name = sensor_cfg.name
+    first_err = None
+    second_err = None
+
     try:
         val = base_mdp.image(env, sensor_cfg, data_type=data_type, normalize=normalize)
-        if val is not None and val.numel() > 0:
+        if _is_valid_image(val):
             return val
-    except Exception:
-        pass
-    # 폴백: 렌더 버퍼가 비어 있을 때 0-패딩 텐서를 반환한다.
-    # 주의 — sensor.data 접근은 동일한 버퍼 갱신(_update_buffers_impl) 크래시를
-    # 재유발하므로(렌더 리소스가 비어 있을 때 [720,1280,3] expand 실패) 절대
-    # 건드리지 않고, 해상도는 센서 cfg(고정 width/height)에서 직접 읽는다.
-    sensor = env.scene[sensor_cfg.name]
+    except Exception as exc:
+        first_err = exc
+
+    # render 버퍼가 일시적으로 비어 있는 경우를 위해 센서를 강제 갱신한 뒤 1회 재시도.
+    try:
+        cam = env.scene[sensor_name]
+        cam.update(getattr(env, "step_dt", 0.0), force_recompute=True)
+        val = base_mdp.image(env, sensor_cfg, data_type=data_type, normalize=normalize)
+        if _is_valid_image(val):
+            return val
+    except Exception as exc:
+        second_err = exc
+
+    # 실패 원인은 센서별로 희소하게만 로그하여 콘솔 스팸을 방지.
+    warn_key = "_safe_image_fallback_warn_count"
+    warn_map = getattr(env, warn_key, None)
+    if warn_map is None:
+        warn_map = {}
+        setattr(env, warn_key, warn_map)
+    count = int(warn_map.get(sensor_name, 0)) + 1
+    warn_map[sensor_name] = count
+    if count in (1, 10, 100) or count % 500 == 0:
+        carb.log_warn(
+            "[safe_image] fallback to zeros "
+            f"sensor={sensor_name} count={count} "
+            f"first_err={repr(first_err)} second_err={repr(second_err)}"
+        )
+
+    # 폴백: sensor.data 접근은 동일한 버퍼 갱신 크래시를 재유발할 수 있어 금지.
+    sensor = env.scene[sensor_name]
     try:
         h = int(sensor.cfg.height)
         w = int(sensor.cfg.width)
@@ -418,11 +449,10 @@ def safe_image(env, sensor_cfg, data_type="rgb", normalize=False):
         h, w = 0, 0
     c = 3 if data_type == "rgb" else 1
     device = env.device
-    # ObservationManager가 단일 env일 때 (H, W, C) 형태를 기대하는 케이스가 있어
-    # env 개수에 따라 배치 차원을 조건부로 맞춥니다.
-    if getattr(env, "num_envs", 1) == 1:
-        return torch.zeros((h, w, c), dtype=torch.float32, device=device)
-    return torch.zeros((env.num_envs, h, w, c), dtype=torch.float32, device=device)
+    # Recorder 경로는 카메라 텐서의 선행 축을 env 배치로 가정해 [env_id]로 인덱싱한다.
+    num_envs = int(getattr(env, "num_envs", 1))
+    dtype = torch.uint8 if data_type == "rgb" else torch.float32
+    return torch.zeros((num_envs, h, w, c), dtype=dtype, device=device)
 
 
 @configclass
